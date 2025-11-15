@@ -3,7 +3,23 @@ mod app;
 mod helper;
 
 use rustyline::{Config, Editor, error::ReadlineError};
-use std::sync::atomic::Ordering;
+use std::{
+    path::PathBuf,
+    sync::{atomic::Ordering, LazyLock},
+};
+
+/// LazyLock: 전역 혹은 static 값을 게으르게 초기화하고 싶을 때 사용
+///   - 전역(static) 객체가 무겁거나 초기 생성 비용이 비쌀 때
+///   - 전역 객체가 다른 전역 객체에 의존할 때
+/// : Rust의 static 값은 const 평가가 가능한 값만 넣을 수 있기 때문
+/// 
+/// PathBuf와 Path의 관계
+///   - PathBuf: 소유한 경로
+///   - Path: 빌려온 경로
+///   - PathBuf는 String, Path는 str에 대응되는 개념이라고 보면 됨.
+pub static HOME_DIR: LazyLock<PathBuf> = LazyLock::new(|| dirs::home_dir().expect("could not determine home directory"));
+
+pub static HISTORY_FILE: LazyLock<PathBuf> = LazyLock::new(|| HOME_DIR.join(".grain_history"));
 
 fn rustyline_config() -> Config {
     Config::builder()
@@ -20,7 +36,10 @@ fn main() -> anyhow::Result<()> {
 
     // rustyline은 tty에서만 동작한다.
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        let rl = Editor::with_config(rustyline_config())?;
+        let mut rl = Editor::with_config(rustyline_config())?;
+        if HISTORY_FILE.exists() {
+            rl.load_history(HISTORY_FILE.as_path())?;
+        }
         app = app.with_readline(rl);
     } else {
         tracing::debug!("not in tty");

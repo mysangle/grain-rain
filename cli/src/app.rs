@@ -1,5 +1,8 @@
 
-use crate::helper::GrainHelper;
+use crate::{
+    helper::GrainHelper,
+    HISTORY_FILE,
+};
 use std::{
     io::{BufRead, IsTerminal},
     mem::ManuallyDrop,
@@ -106,6 +109,7 @@ impl GrainRain {
         match (value.starts_with('.'), value.ends_with(';')) {
             (true, _) => {
                 if value == ".quit" {
+                    self.save_history();
                     // 사용자가 '.quit'를 입력하면 프로세스 종료
                     std::process::exit(0);
                 }
@@ -135,6 +139,12 @@ impl GrainRain {
 
     fn reset_line(&mut self) {
         self.interrupt_count.store(0, Ordering::Release);
+    }
+
+    fn save_history(&mut self) {
+        if let Some(rl) = &mut self.rl {
+            let _ = rl.save_history(HISTORY_FILE.as_path());
+        }
     }
 }
 
