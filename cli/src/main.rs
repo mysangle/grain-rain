@@ -8,6 +8,10 @@ use std::{
     sync::{atomic::Ordering, LazyLock},
 };
 
+/// Error 처리:
+///   - 애플리케이션 레벨에서는 anyhow를 사용하고,
+///   - 라이브러리 레벨에서는 thiserror를 사용한다.
+
 /// LazyLock: 전역 혹은 static 값을 게으르게 초기화하고 싶을 때 사용
 ///   - 전역(static) 객체가 무겁거나 초기 생성 비용이 비쌀 때
 ///   - 전역 객체가 다른 전역 객체에 의존할 때
