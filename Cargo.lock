@@ -41,6 +41,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "grain",
  "rustyline",
  "tracing",
  "tracing-appender",
@@ -143,6 +144,13 @@ dependencies = [
  "cfg-if",
  "libc",
  "wasi",
+]
+
+[[package]]
+name = "grain"
+version = "0.1.0"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]

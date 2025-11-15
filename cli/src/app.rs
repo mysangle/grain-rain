@@ -3,6 +3,7 @@ use crate::{
     helper::GrainHelper,
     HISTORY_FILE,
 };
+use grain::Database;
 use std::{
     io::{BufRead, IsTerminal},
     mem::ManuallyDrop,
@@ -29,6 +30,9 @@ pub struct GrainRain {
 impl GrainRain {
     pub fn new() -> anyhow::Result<(Self, WorkerGuard)> {
         let guard = Self::init_tracing()?;
+
+        let db_file = ":memory:";
+        let _ = Database::open_new(&db_file);
 
         let interrupt_count = Arc::new(AtomicUsize::new(0));
 
