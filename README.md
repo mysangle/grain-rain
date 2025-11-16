@@ -1,4 +1,4 @@
 # Grain Rain
 
-* Learning Database Internals
+* Learning Database Internals From [Turso](https://github.com/tursodatabase/turso)
 
