@@ -1,0 +1,16 @@
+[package]
+name = "grain_core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arc-swap = "1.7"
+bytemuck = "1.23.1"
+grain_macros = { workspace = true }
+grain_parser = { workspace = true }
+libc = { version = "0.2.172" }
+pack1 = { version = "1.0.0", features = ["bytemuck"] }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+twox-hash = "2.1.1"

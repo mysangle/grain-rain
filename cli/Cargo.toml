@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow.workspace = true
 dirs = "5.0.1"
-grain = { workspace = true }
+grain_core = { workspace = true }
 rustyline = { version = "15.0.0", default-features = true, features = ["derive"] }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }

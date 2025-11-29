@@ -2,12 +2,17 @@
 resolver = "2"
 members = [
     "cli",
-    "grain",
+    "grain_core",
+    "macros",
+    "parser",
 ]
 
 [workspace.dependencies]
 anyhow = "1.0.98"
-grain = { path = "grain", version = "0.1.0" }
+grain_core = { path = "grain_core", version = "0.1.0" }
+grain_macros = { path = "macros", version = "0.1.0" }
+grain_parser = { path = "parser", version = "0.1.0" }
+parking_lot = "0.12.4"
 thiserror = "2.0.16"
 tracing = "0.1.41"
 tracing-appender = "0.2.3"
