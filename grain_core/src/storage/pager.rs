@@ -1,9 +1,11 @@
 
 use crate::{
     io_yield_one, return_if_io,
+    error::GrainError,
     storage::{
         buffer_pool::BufferPool,
         database::DatabaseStorage,
+        page_cache::{PageCache, PageCacheKey},
         sqlite3_ondisk::{
             begin_write_btree_page,
             DatabaseHeader, PageContent, PageSize, PageType,
@@ -17,6 +19,7 @@ use grain_macros::AtomicEnum;
 use parking_lot::{Mutex, RwLock};
 use std::{
     cell::{RefCell, UnsafeCell},
+    collections::BTreeSet,
     rc::Rc,
     sync::{
         atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -85,12 +88,33 @@ impl Page {
         self.clear_wal_tag();
     }
 
+    pub fn is_locked(&self) -> bool {
+        self.get().flags.load(Ordering::Acquire) & PAGE_LOCKED != 0
+    }
+
+    pub fn set_locked(&self) {
+        self.get().flags.fetch_or(PAGE_LOCKED, Ordering::Acquire);
+    }
+
+    pub fn clear_locked(&self) {
+        self.get().flags.fetch_and(!PAGE_LOCKED, Ordering::Release);
+    }
+
     pub fn is_loaded(&self) -> bool {
         self.get().flags.load(Ordering::Acquire) & PAGE_LOADED != 0
     }
 
     pub fn set_loaded(&self) {
         self.get().flags.fetch_or(PAGE_LOADED, Ordering::Release);
+    }
+
+    pub fn clear_loaded(&self) {
+        tracing::debug!("clear loaded {}", self.get().id);
+        self.get().flags.fetch_and(!PAGE_LOADED, Ordering::Release);
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        self.get().pin_count.load(Ordering::Acquire) > 0
     }
 
     #[inline]
@@ -143,6 +167,9 @@ enum AllocatePage1State {
     Done,
 }
 
+/// page 관리
+/// WAL이나 DB에서 가져온 페이지를 PageCache로 관리
+/// Page 1 : DB header + sqlite_schema table의 루트 페이지
 pub struct Pager {
     pub db_file: Arc<dyn DatabaseStorage>,
     pub(crate) wal: Option<Rc<RefCell<dyn Wal>>>,
@@ -150,6 +177,8 @@ pub struct Pager {
     pub db_state: Arc<AtomicDbState>,
     pub(crate) page_size: AtomicU32,
     pub buffer_pool: Arc<BufferPool>,
+    page_cache: Arc<RwLock<PageCache>>,
+    dirty_pages: Arc<RwLock<BTreeSet<usize>>>,
     init_lock: Arc<Mutex<()>>,
     // DB가 초기화가 안된경우(Uninitialized) Start로 시작, 초기화중(Initializing)에 Writing으로 변경
     allocate_page1_state: RwLock<AllocatePage1State>,
@@ -167,6 +196,7 @@ impl Pager {
         db_file: Arc<dyn DatabaseStorage>,
         wal: Option<Rc<RefCell<dyn Wal>>>,
         io: Arc<dyn crate::io::IO>,
+        page_cache: Arc<RwLock<PageCache>>,
         db_state: Arc<AtomicDbState>,
         buffer_pool: Arc<BufferPool>,
         init_lock: Arc<Mutex<()>>,
@@ -184,6 +214,8 @@ impl Pager {
             db_state,
             page_size: AtomicU32::new(0),
             buffer_pool,
+            page_cache,
+            dirty_pages: Arc::new(RwLock::new(BTreeSet::new())),
             init_lock,
             allocate_page1_state,
             io_ctx: RwLock::new(IOContext::default()),
@@ -200,7 +232,8 @@ impl Pager {
         let changed = wal.borrow_mut().begin_read_tx()?;
         if changed {
             // 데이터베이스가 변경되었다.
-            // TODO: page cache invalidate
+            // page cache invalidate
+            self.clear_page_cache(false);
         }
 
         Ok(())
@@ -235,6 +268,26 @@ impl Pager {
         self.page_size.store(size.get(), Ordering::SeqCst);
     }
 
+    /// 페이지 캐시를 무효화
+    /// begin_read_tx에서 호출되는 경우에는 dirty_pages가 비어있을 것이다.
+    pub fn clear_page_cache(&self, clear_dirty: bool) {
+        let dirty_pages = self.dirty_pages.read();
+        let mut cache = self.page_cache.write();
+
+        // dirty page가 캐시에 있으면 더티 비트를 clear
+        // 실제 더티 페이지를 처리하는 건 다른 곳에서 이루어진다. 예: rollback
+        for page_id in dirty_pages.iter() {
+            let page_key = PageCacheKey::new(*page_id);
+            if let Some(page) = cache.get(&page_key).unwrap_or(None) {
+                page.clear_dirty();
+            }
+        }
+
+        cache
+            .clear(clear_dirty)
+            .expect("Failed to clear page cache");
+    }
+
     /// unchecked가 붙어 있는 이유: page_size에 제대로된 값이 들어가 있는지 확인하지 않는 함수라는 의미
     /// Pager에 저장되어 있는 page size에 올바르지 않은 값이 저장되어 있으면 panic
     pub fn get_page_size_unchecked(&self) -> PageSize {
@@ -247,8 +300,41 @@ impl Pager {
         self.set_reserved_space(value);
     }
 
+    pub fn get_reserved_space(&self) -> Option<u8> {
+        let value = self.reserved_space.load(Ordering::SeqCst);
+        if value == RESERVED_SPACE_NOT_SET {
+            None
+        } else {
+            Some(value as u8)
+        }
+    }
+
     pub fn set_reserved_space(&self, space: u8) {
         self.reserved_space.store(space as u16, Ordering::SeqCst);
+    }
+
+    pub fn usable_space(&self) -> usize {
+        let page_size = self.get_page_size().unwrap_or_else(|| {
+            // 페이지 크기가 없으면 파일 헤더에서 얻어온다.
+            let size = self
+                .io
+                .block(|| self.with_header(|header| header.page_size))
+                .unwrap_or_default();
+            self.page_size.store(size.get(), Ordering::SeqCst);
+            size
+        });
+
+        let reserved_space = self.get_reserved_space().unwrap_or_else(|| {
+            // reserved space가 없으면 파일 헤더에서 얻어온다.
+            let space = self
+                .io
+                .block(|| self.with_header(|header| header.reserved_space))
+                .unwrap_or_default();
+            self.set_reserved_space(space);
+            space
+        });
+
+        (page_size.get() as usize) - (reserved_space as usize)
     }
 
     pub fn reset_checksum_context(&self) {
@@ -351,7 +437,12 @@ impl Pager {
                 assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done)");
 
-                // TODO: 페이지 캐시에 넣기
+                // 페이지 캐시에 넣기
+                let page_key = PageCacheKey::new(page.get().id);
+                let mut cache = self.page_cache.write();
+                cache.insert(page_key, page.clone()).map_err(|e| {
+                    GrainError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
+                })?;
 
                 self.db_state.set(DbState::Initialized);
                 *self.allocate_page1_state.write() = AllocatePage1State::Done;
@@ -367,6 +458,7 @@ pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>, offset: us
     {
         let buffer = buffer_pool.get_page();
         let buffer = Arc::new(buffer);
+
         page.set_loaded();
         page.clear_wal_tag();
         page.get().contents = Some(PageContent::new(offset, buffer));

@@ -1,20 +1,25 @@
 
 mod error;
 mod fast_lock;
+pub mod numeric;
 pub mod mvcc;
 pub mod io;
 pub mod schema;
 pub mod storage;
+mod translate;
 pub mod types;
 mod util;
 
+use arc_swap::{ArcSwap, ArcSwapOption};
 use crate::{
     storage::{
         checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
         database::DatabaseFile,
+        page_cache::PageCache,
         pager::{AtomicDbState, DbState},
         sqlite3_ondisk::PageSize,
     },
+    translate::emitter::TransactionMode,
 };
 
 pub use crate::{
@@ -28,16 +33,17 @@ pub use crate::{
     },
 };
 
-use arc_swap::ArcSwap;
+use grain_macros::AtomicEnum;
 use grain_parser::parser::Parser;
 pub use io::{Buffer, Completion};
 use parking_lot::{Mutex, RwLock};
 use schema::Schema;
 use std::{
     cell::RefCell,
+    ops::Deref,
     rc::Rc,
     sync::{
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
         Arc,
     },
 };
@@ -45,6 +51,16 @@ use types::IOResult;
 
 pub type Result<T, E = GrainError> = std::result::Result<T, E>;
 pub(crate) type MvStore = mvcc::MvStore<mvcc::LocalClock>;
+
+/// AtomicEnum은 2021에서 사용 가능. 2024에서는 에러
+/// AtomicEnum이 무었인지는 DbState( in storage/pager.rs) 참고
+#[derive(AtomicEnum, Clone, Copy, Debug, Eq, PartialEq)]
+enum TransactionState {
+    Write { schema_did_change: bool },
+    Read,
+    PendingUpgrade,
+    None,
+}
 
 /// 여러 connection 사이에 공유되는 Database
 /// 따라서, Send와 Sync이어야 한다.
@@ -57,9 +73,10 @@ pub struct Database {
     db_file: Arc<dyn DatabaseStorage>,
     // write-ahead log
     shared_wal: Arc<RwLock<WalFileShared>>,
-    mv_store: Arc<MvStore>,
+    mv_store: ArcSwapOption<MvStore>,
     db_state: Arc<AtomicDbState>,
     buffer_pool: Arc<BufferPool>,
+    _shared_page_cache: Arc<RwLock<PageCache>>,
     schema: Mutex<Arc<Schema>>,
     init_lock: Arc<Mutex<()>>,
 }
@@ -119,7 +136,7 @@ impl Database {
             let file = io.open_file(&format!("{path}-log"), false)?;
             let storage = mvcc::persistent_storage::Storage::new(file);
             let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
-            Arc::new(mv_store)
+            ArcSwapOption::new(Some(Arc::new(mv_store)))
         };
 
         let db_size = db_file.size()?;
@@ -128,6 +145,7 @@ impl Database {
         } else {
             DbState::Initialized
         };
+        let shared_page_cache = Arc::new(RwLock::new(PageCache::default()));
         let arena_size = BufferPool::DEFAULT_ARENA_SIZE;
 
         let db = Arc::new(Database {
@@ -139,13 +157,23 @@ impl Database {
             mv_store,
             db_state: Arc::new(AtomicDbState::new(db_state)),
             buffer_pool: BufferPool::begin_init(&io, arena_size),
+            _shared_page_cache: shared_page_cache.clone(),
             schema: Mutex::new(Arc::new(Schema::new())),
             init_lock: Arc::new(Mutex::new(())),
         });
 
         if db_state.is_initialized() {
             // TODO: 파일이 이미 있는 경우 내용을 읽기
+            let conn = db.connect()?;
         }
+
+        {
+            let mv_store = db.get_mv_store();
+            let mv_store = mv_store.as_ref().unwrap();
+            let mvcc_bootstrap_conn = db.connect_mvcc_bootstrap()?;
+            mv_store.bootstrap(mvcc_bootstrap_conn)?;
+        }
+        
         Ok(db)
     }
 
@@ -162,8 +190,14 @@ impl Database {
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: ArcSwap::new(pager),
+            schema: RwLock::new(self.schema.lock().clone()),
             page_size: AtomicU16::new(page_size.get_raw()),
-
+            syms: RwLock::new(SymbolTable::new()),
+            mv_tx: RwLock::new(None),
+            auto_commit: AtomicBool::new(true),
+            transaction_state: AtomicTransactionState::new(TransactionState::None),
+            closed: AtomicBool::new(false),
+            is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
         });
         Ok(conn)
     }
@@ -176,6 +210,10 @@ impl Database {
     fn read_reserved_space_bytes_from_db_header(&self) -> Result<u8> {
         // TODO: 디비 헤더 읽기
         Ok(8)
+    }
+
+    pub fn get_mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
+        self.mv_store.load()
     }
 
     /// 다음의 순서로 페이지 크기를 계산한다.
@@ -247,6 +285,7 @@ impl Database {
                 self.db_file.clone(),
                 Some(wal),
                 self.io.clone(),
+                Arc::new(RwLock::new(PageCache::default())),
                 db_state,
                 buffer_pool.clone(),
                 self.init_lock.clone(),
@@ -277,6 +316,7 @@ impl Database {
             self.db_file.clone(),
             None,
             self.io.clone(),
+            Arc::new(RwLock::new(PageCache::default())),
             db_state,
             buffer_pool.clone(),
             self.init_lock.clone(),
@@ -306,16 +346,93 @@ impl Database {
     }
 }
 
-/// 쓰레드 별 연결
+/// Connection에서는 한번에 하나의 트랜잭션만 가능하게 동작한다.
 pub struct Connection {
     db: Arc<Database>,
     pager: ArcSwap<Pager>,
+    schema: RwLock<Arc<Schema>>,
     page_size: AtomicU16,
+    syms: RwLock<SymbolTable>,
+    pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
+
+    // 커밋을 자동으로 할지 말지 여부
+    auto_commit: AtomicBool,
+    transaction_state: AtomicTransactionState,
+    // 연결 유지 여부. 연결을 끊으면 true로 설정
+    closed: AtomicBool,
+    // mvcc bootstrap을 위한 연결 여부
+    is_mvcc_bootstrap_connection: AtomicBool,
 }
 
 impl Connection {
+    pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
+        self._prepare(sql)
+    }
+
+    pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
+        if self.is_closed() {
+            return Err(GrainError::InternalError("Connection closed".to_string()));
+        }
+        if sql.as_ref().is_empty() {
+            return Err(GrainError::InvalidArgument(
+                "The supplied SQL string contains no statements".to_string(),
+            ));
+        }
+
+        let sql = sql.as_ref();
+        tracing::debug!("Preparing: {}", sql);
+
+        Ok(Statement::new())
+    }
+
+    pub fn promote_to_regular_connection(&self) {
+        assert!(self.is_mvcc_bootstrap_connection.load(Ordering::SeqCst));
+        self.is_mvcc_bootstrap_connection.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
     pub fn query_runner<'a>(self: &'a Arc<Connection>, sql: &'a [u8]) -> QueryRunner<'a> {
         QueryRunner::new(self, sql)
+    }
+
+    pub fn is_mvcc_bootstrap_connection(&self) -> bool {
+        self.is_mvcc_bootstrap_connection.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn get_mv_tx_id(&self) -> Option<u64> {
+        self.mv_tx.read().map(|(tx_id, _)| tx_id)
+    }
+
+    pub(crate) fn get_mv_tx(&self) -> Option<(u64, TransactionMode)> {
+        *self.mv_tx.read()
+    }
+
+    pub(crate) fn set_mv_tx(&self, tx_id_and_mode: Option<(u64, TransactionMode)>) {
+        *self.mv_tx.write() = tx_id_and_mode;
+    }
+
+    fn set_tx_state(&self, state: TransactionState) {
+        self.transaction_state.set(state);
+    }
+
+    fn get_tx_state(&self) -> TransactionState {
+        self.transaction_state.get()
+    }
+}
+
+#[derive(Default)]
+pub struct SymbolTable {
+
+}
+
+impl SymbolTable {
+    pub fn new() -> Self {
+        Self {
+            
+        }
     }
 }
 
@@ -347,4 +464,12 @@ impl Iterator for QueryRunner<'_> {
 
 pub struct Statement {
 
+}
+
+impl Statement {
+    pub fn new() -> Self {
+        Self {
+
+        }
+    }
 }

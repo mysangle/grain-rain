@@ -1,17 +1,13 @@
-
-use crate::{fast_lock::SpinLock, io::TEMP_BUFFER_CACHE, Buffer, GrainError, IO, Result};
+use super::{slot_bitmap::SlotBitmap, sqlite3_ondisk::WAL_FRAME_HEADER_SIZE};
+use crate::{Buffer, GrainError, IO, Result, fast_lock::SpinLock, io::TEMP_BUFFER_CACHE};
 use parking_lot::Mutex;
 use std::{
     cell::UnsafeCell,
     ptr::NonNull,
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
         Arc, Weak,
+        atomic::{AtomicU32, AtomicUsize, Ordering},
     },
-};
-use super::{
-    slot_bitmap::SlotBitmap,
-    sqlite3_ondisk::WAL_FRAME_HEADER_SIZE,
 };
 
 #[derive(Debug)]
@@ -24,7 +20,7 @@ pub struct ArenaBuffer {
     arena_id: u32,
     // 아레나 내부 슬롯의 인덱스. 연속 슬롯이라면 첫번째 슬롯
     slot_idx: u32,
-    // 실제 할당 요청 크기(내부에서 실제로 할당한 크기는 더 클 수 있다.) 
+    // 실제 할당 요청 크기(내부에서 실제로 할당한 크기는 더 클 수 있다.)
     len: usize,
 }
 
@@ -84,7 +80,7 @@ impl std::ops::DerefMut for ArenaBuffer {
 
 /// 데이터베이스 운영에 필요한 메모리 버퍼(Buffer)들을 효율적으로 할당하고 재사용
 ///   - 페이지를 요청하면 Arena로부터 페이지 크기의 Buffer를 리턴한다.
-/// 
+///
 /// 1. 초기 단계 (Arena 없음):
 ///   BufferPool이 begin_init을 통해 처음 생성될 때, 아직 Arena는 만들어지지 않습니다. 이
 ///   시점에서 데이터베이스의 실제 page_size를 아직 모르기 때문입니다.
@@ -136,7 +132,7 @@ impl BufferPool {
                 page_arena: None,
                 wal_frame_arena: None,
                 init_lock: Mutex::new(()),
-            })
+            }),
         }
     }
 
@@ -259,7 +255,7 @@ impl PoolInner {
                 )));
             }
         }
-        
+
         Ok(())
     }
 }
@@ -366,32 +362,37 @@ impl Arena {
 
 mod arena {
     use libc::MAP_ANONYMOUS;
-    use libc::{mmap, munmap, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+    use libc::{MAP_PRIVATE, PROT_READ, PROT_WRITE, mmap, munmap};
     use std::ffi::c_void;
 
     pub unsafe fn alloc(len: usize) -> *mut u8 {
-        let ptr = mmap(
-            std::ptr::null_mut(),
-            len,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            -1,
-            0,
-        );
-        if ptr == libc::MAP_FAILED {
-            panic!("mmap failed: {}", std::io::Error::last_os_error());
+        unsafe {
+            // virtual memory mapping
+            let ptr = mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            if ptr == libc::MAP_FAILED {
+                panic!("mmap failed: {}", std::io::Error::last_os_error());
+            }
+            //#[cfg(target_os = "linux")]
+            //{
+            //    libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+            //}
+            ptr as *mut u8
         }
-        //#[cfg(target_os = "linux")]
-        //{
-        //    libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
-        //}
-        ptr as *mut u8
     }
 
     pub unsafe fn dealloc(ptr: *mut u8, len: usize) {
-        let result = munmap(ptr as *mut c_void, len);
-        if result != 0 {
-            panic!("munmap failed: {}", std::io::Error::last_os_error());
+        unsafe {
+            let result = munmap(ptr as *mut c_void, len);
+            if result != 0 {
+                panic!("munmap failed: {}", std::io::Error::last_os_error());
+            }
         }
     }
 }

@@ -4,6 +4,7 @@ use crate::{
     HISTORY_FILE,
 };
 use grain_core::Database;
+use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
 use std::{
     io::{BufRead, IsTerminal},
     mem::{forget, ManuallyDrop},
@@ -13,8 +14,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-
-use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
