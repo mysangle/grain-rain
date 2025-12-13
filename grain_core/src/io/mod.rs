@@ -21,6 +21,8 @@ use std::{
 };
 
 pub trait File: Send + Sync {
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion>;
+    
     fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
     
     fn size(&self) -> Result<u64>;
@@ -33,6 +35,23 @@ pub trait IO: Clock + Send + Sync {
         Err(crate::GrainError::InternalError(
             "unsupported operation".to_string(),
         ))
+    }
+
+    fn wait_for_completion(&self, c: Completion) -> Result<()> {
+        // 기본 구현은 busy loop
+        while !c.finished() {
+            self.step()?
+        }
+        if let Some(inner) = &c.inner {
+            if let Some(Some(err)) = inner.result.get().copied() {
+                return Err(err.into());
+            }
+        }
+        Ok(())
+    }
+
+    fn step(&self) -> Result<()> {
+        Ok(())
     }
 }
 

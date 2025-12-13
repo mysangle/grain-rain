@@ -2,8 +2,15 @@
 use crate::{
     fast_lock::SpinLock,
     io::{File, IO},
-    storage::{buffer_pool::BufferPool, sqlite3_ondisk::WalHeader},
-    GrainError, Result,
+    storage::{
+        buffer_pool::BufferPool,
+        sqlite3_ondisk::{
+            begin_read_wal_frame,
+            finish_read_page,
+            WalHeader, WAL_HEADER_SIZE, WAL_FRAME_HEADER_SIZE,
+        },
+    },
+    Buffer, Completion, CompletionError, GrainError, IOContext, Result,
 };
 use parking_lot::RwLock;
 use std::{
@@ -14,11 +21,16 @@ use std::{
         Arc,
     },
 };
-use super::sqlite3_ondisk::{WAL_MAGIC_BE, WAL_MAGIC_LE};
+use super::{
+    pager::PageRef,
+    sqlite3_ondisk::{WAL_MAGIC_BE, WAL_MAGIC_LE},
+};
 
 pub const READMARK_NOT_USED: u32 = 0xffffffff;
 const NO_LOCK_HELD: usize = usize::MAX;
 
+#[repr(transparent)]
+#[derive(Debug, Default)]
 pub struct GrainRwLock(AtomicU64);
 
 /// 64 비트 read-write lock
@@ -129,6 +141,8 @@ pub trait Wal: Debug {
     fn begin_write_tx(&mut self) -> Result<()>;
     fn end_read_tx(&self);
     fn end_write_tx(&self);
+    fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<u64>>;
+    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) -> Result<Completion>;
 }
 
 /// 개별 데이터베이스 연결(connection)이 WAL 시스템과 상호작용하기 위한 기본 핸들
@@ -148,6 +162,7 @@ pub struct WalFile {
     // WalFile 생성 시점의 WAL header 스냅샷.
     // 디버깅 용도 또는 변하지 않는 값 빠르게 액세스 하기
     pub header: WalHeader,
+    io_ctx: RwLock<IOContext>,
 }
 
 impl WalFile {
@@ -177,6 +192,7 @@ impl WalFile {
             checkpoint_seq: AtomicU32::new(0),
             transaction_count: AtomicU64::new(0),
             header,
+            io_ctx: RwLock::new(IOContext::default()),
         }
     }
 
@@ -220,6 +236,16 @@ impl WalFile {
             || checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire)
             || transaction_count != self.transaction_count.load(Ordering::Acquire)
             || nbackfills + 1 != self.min_frame.load(Ordering::Acquire)
+    }
+
+    fn page_size(&self) -> u32 {
+        self.with_shared(|shared| shared.wal_header.lock().page_size)
+    }
+
+    fn frame_offset(&self, frame_id: u64) -> u64 {
+        assert!(frame_id > 0, "Frame ID must be 1-based");
+        let page_offset = (frame_id - 1) * (self.page_size() + WAL_FRAME_HEADER_SIZE as u32) as u64;
+        WAL_HEADER_SIZE as u64 + page_offset
     }
 }
 
@@ -325,6 +351,68 @@ impl Wal for WalFile {
         tracing::debug!("end_write_txn");
         self.with_shared(|shared| shared.write_lock.unlock());
     }
+
+    fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<u64>> {
+        assert!(
+            frame_watermark.is_none(),
+            "unexpected use of frame_watermark optional argument"
+        );
+
+        Ok(None)
+    }
+
+    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) -> Result<Completion> {
+        tracing::debug!(
+            "read_frame(page_idx = {}, frame_id = {})",
+            page.get().id,
+            frame_id
+        );
+        let offset = self.frame_offset(frame_id);
+        page.set_locked();
+        let frame = page.clone();
+        let page_idx = page.get().id;
+        let shared_file = self.shared.clone();
+        let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+            let Ok((buf, bytes_read)) = res else {
+                tracing::error!(err = ?res.unwrap_err());
+                page.clear_locked();
+                page.clear_wal_tag();
+                return;
+            };
+            let buf_len = buf.len();
+            assert!(
+                bytes_read == buf_len as i32,
+                "read({bytes_read}) less than expected({buf_len}): frame_id={frame_id}"
+            );
+            let cloned = frame.clone();
+            finish_read_page(page.get().id, buf, cloned);
+            let epoch = shared_file.read().epoch.load(Ordering::Acquire);
+            frame.set_wal_tag(frame_id, epoch);
+        });
+        let file = self.with_shared(|shared| {
+            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+            // important not to hold shared lock beyond this point to avoid deadlock scenario where:
+            // thread 1: takes readlock here, passes reference to shared.file to begin_read_wal_frame
+            // thread 2: tries to acquire write lock elsewhere
+            // thread 1: tries to re-acquire read lock in the completion (see 'complete' above)
+            //
+            // this causes a deadlock due to the locking policy in parking_lot:
+            // from https://docs.rs/parking_lot/latest/parking_lot/type.RwLock.html:
+            // "This lock uses a task-fair locking policy which avoids both reader and writer starvation.
+            // This means that readers trying to acquire the lock will block even if the lock is unlocked
+            // when there are writers waiting to acquire the lock.
+            // Because of this, attempts to recursively acquire a read lock within a single thread may result in a deadlock."
+            shared.file.as_ref().unwrap().clone()
+        });
+        begin_read_wal_frame(
+            file.as_ref(),
+            offset + WAL_FRAME_HEADER_SIZE as u64,
+            buffer_pool,
+            complete,
+            page_idx,
+            &self.io_ctx.read(),
+        )
+    }
 }
 
 /// 하나의 WAL 파일에 대한 관리
@@ -342,6 +430,7 @@ pub struct WalFileShared {
     pub file: Option<Arc<dyn File>>,
     pub read_locks: [GrainRwLock; 5],
     pub write_lock: GrainRwLock,
+    pub epoch: AtomicU32,
 }
 
 impl WalFileShared {
@@ -350,14 +439,14 @@ impl WalFileShared {
         let file = io.open_file(path, false)?;
         if file.size()? == 0 {
             // WAL 파일이 없는 경우 새로 생성한다.
-            return WalFileShared::new_noop();
+            return Ok(WalFileShared::new_noop());
         }
 
         // TODO: 이미 WAL 파일이 있는 경우 내용을 읽는다.
-        WalFileShared::new_noop()
+        Ok(WalFileShared::new_noop())
     }
 
-    pub fn new_noop() -> Result<Arc<RwLock<WalFileShared>>> {
+    pub fn new_noop() -> Arc<RwLock<WalFileShared>> {
         let wal_header = WalHeader {
             magic: 0,
             file_format: 0,
@@ -387,8 +476,9 @@ impl WalFileShared {
             file: None,
             read_locks,
             write_lock: GrainRwLock::new(),
+            epoch: AtomicU32::new(0),
         };
-        Ok(Arc::new(RwLock::new(shared)))
+        Arc::new(RwLock::new(shared))
     }
 
     // WAL 헤더에 magic과 file format 설정

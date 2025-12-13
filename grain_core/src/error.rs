@@ -12,16 +12,32 @@ pub enum GrainError {
     CompletionError(#[from] CompletionError),
     #[error("Corrupt database: {0}")]
     Corrupt(String),
+    #[error("Extension error: {0}")]
+    ExtensionError(String),
     #[error("Runtime error: integer overflow")]
     IntegerOverflow,
     #[error("Internal error: {0}")]
     InternalError(String),
     #[error("Invalid argument supplied: {0}")]
     InvalidArgument(String),
+    #[error("File is not a database")]
+    NotADB,
+    #[error("No such transaction ID: {0}")]
+    NoSuchTransactionID(String),
+    #[error(
+        "Database is empty, header does not exist - page 1 should've been allocated before this"
+    )]
+    Page1NotAlloc,
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
 pub enum CompletionError {
+    #[error("Checksum mismatch on page {page_id}: expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        page_id: usize,
+        expected: u64,
+        actual: u64,
+    },
     #[error("I/O error: {0}")]
     IOError(std::io::ErrorKind),
 }

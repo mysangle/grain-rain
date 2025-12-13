@@ -1,4 +1,5 @@
 
+use arc_swap::ArcSwapOption;
 use crate::{
     io_yield_one, return_if_io,
     error::GrainError,
@@ -7,15 +8,16 @@ use crate::{
         database::DatabaseStorage,
         page_cache::{PageCache, PageCacheKey},
         sqlite3_ondisk::{
+            self,
             begin_write_btree_page,
             DatabaseHeader, PageContent, PageSize, PageType,
         },
         wal::Wal,
     },
     types::IOCompletions,
-    Completion, IOContext, IOResult, Result,
+    util::IOExt,
+    Buffer, Completion, IOContext, IOResult, Result,
 };
-use grain_macros::AtomicEnum;
 use parking_lot::{Mutex, RwLock};
 use std::{
     cell::{RefCell, UnsafeCell},
@@ -26,12 +28,74 @@ use std::{
         Arc,
     },
 };
-use super::btree::btree_init_page;
+use super::{btree::btree_init_page, page_cache::CacheError};
 
 const RESERVED_SPACE_NOT_SET: u16 = u16::MAX;
 
 /// 유효한 WAL tag가 설정되지 않음
 pub const TAG_UNSET: u64 = u64::MAX;
+
+/// Bit layout:
+/// epoch: 20
+/// frame: 44
+const EPOCH_BITS: u32 = 20;
+const FRAME_BITS: u32 = 64 - EPOCH_BITS;
+const EPOCH_SHIFT: u32 = FRAME_BITS;
+const EPOCH_MAX: u32 = (1u32 << EPOCH_BITS) - 1;
+const FRAME_MAX: u64 = (1u64 << FRAME_BITS) - 1;
+
+#[inline]
+pub fn pack_tag_pair(frame: u64, seq: u32) -> u64 {
+    ((seq as u64) << EPOCH_SHIFT) | (frame & FRAME_MAX)
+}
+
+#[derive(Clone, Debug)]
+enum HeaderRefState {
+    Start,
+    CreateHeader { page: PageRef },
+}
+
+#[derive(Clone, Debug)]
+pub struct HeaderRef(PageRef);
+
+impl HeaderRef {
+    pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
+        loop {
+            let state = pager.header_ref_state.read().clone();
+            tracing::trace!("HeaderRef::from_pager - {:?}", state);
+            match state {
+                HeaderRefState::Start => {
+                    if let Some(page1) = pager.init_page_1.load_full() {
+                        return Ok(IOResult::Done(Self(page1)));
+                    }
+
+                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
+                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
+                    // 페이지 캐시에서 페이지를 읽어온 경우에는 c가 None이므로 바로 다음 state로 간다.
+                    if let Some(c) = c {
+                        // io completion을 기다린다.
+                        io_yield_one!(c);
+                    }
+                }
+                HeaderRefState::CreateHeader { page } => {
+                    assert!(page.is_loaded(), "page should be loaded");
+                    assert!(
+                        page.get().id == DatabaseHeader::PAGE_ID,
+                        "incorrect header page id"
+                    );
+                    *pager.header_ref_state.write() = HeaderRefState::Start;
+                    break Ok(IOResult::Done(Self(page)));
+                }
+            }
+        }
+    }
+
+    pub fn borrow(&self) -> &DatabaseHeader {
+        // TODO: Instead of erasing mutability, implement `get_mut_contents` and return a shared reference.
+        let content: &PageContent = self.0.get_contents();
+        bytemuck::from_bytes::<DatabaseHeader>(&content.buffer.as_slice()[0..DatabaseHeader::SIZE])
+    }
+}
 
 #[derive(Debug)]
 pub struct Page {
@@ -121,6 +185,18 @@ impl Page {
     pub fn clear_wal_tag(&self) {
         self.get().wal_tag.store(TAG_UNSET, Ordering::Release)
     }
+
+    #[inline]
+    /// Set the WAL tag from a (frame, epoch) pair.
+    /// If inputs are invalid, stores TAG_UNSET, which will prevent
+    /// the cached page from being used during checkpoint.
+    pub fn set_wal_tag(&self, frame: u64, epoch: u32) {
+        // use only first 20 bits for seq (max: 1048576)
+        let e = epoch & EPOCH_MAX;
+        self.get()
+            .wal_tag
+            .store(pack_tag_pair(frame, e), Ordering::Release);
+    }
 }
 
 /// 메모리 내 개별 페이지의 변경 가능한 상태와 메타데이터를 관리
@@ -137,29 +213,6 @@ pub struct PageInner {
     pub wal_tag: AtomicU64,
 }
 
-/// AtomicEnum 매크로를 통해 AtomicDbState를 생성한다.
-/// 
-/// 자동으로 생성된 `AtomicDbState`는 내부적으로 `AtomicUsize`나 `AtomicU8` 같은 원자적 정수(atomic integer)를 가집니다.
-/// 
-/// 역할: 데이터베이스의 초기화 상태(`DbState`)를 여러 스레드에서 **경쟁 없이(lock-free) 안전하게 공유**하기 위해 사용됩니다. `Mutex` 같은 락(lock)을 사용하면 동시성 높은 환경에서 성능 저하가 발생할 수 있지만, 원자적(atomic) 연산을 사용하면 훨씬 효율적입니다.
-/// 
-/// 동작 방식:
-///   1.  `DbState`의 각 상태(`Uninitialized`, `Initializing`, `Initialized`)를 내부적으로 정수(예: 0, 1, 2)에 매핑합니다.
-///   2.  `get()` 같은 읽기 메서드는 내부 `AtomicUsize`에 대해 원자적 `load` 연산을 수행하여 현재 상태 값을 가져옵니다.
-///   3.  `set()` 같은 쓰기 메서드는 원자적 `store` 연산을 통해 상태 값을 변경합니다.
-#[derive(AtomicEnum, Clone, Copy, Debug)]
-pub enum DbState {
-    Uninitialized,
-    Initializing,
-    Initialized,
-}
-
-impl DbState {
-    pub fn is_initialized(&self) -> bool {
-        matches!(self, DbState::Initialized)
-    }
-}
-
 #[derive(Clone)]
 enum AllocatePage1State {
     Start,
@@ -174,7 +227,6 @@ pub struct Pager {
     pub db_file: Arc<dyn DatabaseStorage>,
     pub(crate) wal: Option<Rc<RefCell<dyn Wal>>>,
     pub io: Arc<dyn crate::io::IO>,
-    pub db_state: Arc<AtomicDbState>,
     pub(crate) page_size: AtomicU32,
     pub buffer_pool: Arc<BufferPool>,
     page_cache: Arc<RwLock<PageCache>>,
@@ -186,22 +238,30 @@ pub struct Pager {
     pub(crate) io_ctx: RwLock<IOContext>,
     // 값이 설정이 안되어 있는 경우: RESERVED_SPACE_NOT_SET 값으로 처리
     reserved_space: AtomicU16,
+    // 스키마 버전 캐시
+    schema_cookie: AtomicU64,
+    header_ref_state: RwLock<HeaderRefState>,
+    // In Memory Page 1 for Empty Dbs
+    init_page_1: Arc<ArcSwapOption<Page>>,
 }
 
 unsafe impl Send for Pager {}
 unsafe impl Sync for Pager {}
 
 impl Pager {
+    /// Schema cookie sentinel value that represents value not set.
+    const SCHEMA_COOKIE_NOT_SET: u64 = u64::MAX;
+
     pub fn new(
         db_file: Arc<dyn DatabaseStorage>,
         wal: Option<Rc<RefCell<dyn Wal>>>,
         io: Arc<dyn crate::io::IO>,
         page_cache: Arc<RwLock<PageCache>>,
-        db_state: Arc<AtomicDbState>,
         buffer_pool: Arc<BufferPool>,
         init_lock: Arc<Mutex<()>>,
+        init_page_1: Arc<ArcSwapOption<Page>>,
     ) -> Result<Self> {
-        let allocate_page1_state = if !db_state.get().is_initialized() {
+        let allocate_page1_state = if init_page_1.load().is_some() {
             RwLock::new(AllocatePage1State::Start)
         } else {
             RwLock::new(AllocatePage1State::Done)
@@ -211,7 +271,6 @@ impl Pager {
             db_file,
             wal,
             io,
-            db_state,
             page_size: AtomicU32::new(0),
             buffer_pool,
             page_cache,
@@ -220,6 +279,9 @@ impl Pager {
             allocate_page1_state,
             io_ctx: RwLock::new(IOContext::default()),
             reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
+            schema_cookie: AtomicU64::new(Self::SCHEMA_COOKIE_NOT_SET),
+            header_ref_state: RwLock::new(HeaderRefState::Start),
+            init_page_1,
         })
     }
 
@@ -351,20 +413,15 @@ impl Pager {
     /// (DbState::Uninitialized, false): 페이지 할당이 전혀 진행중이지 않은 경우
     /// (DbState::Initializing, true): 초기화를 시작한 쓰레드가 I/O 작업 후 중단된 지점부터 안전하게 작업을 진행할 수 있도록 하기 위한 장치
     pub fn maybe_allocate_page1(&self) -> Result<IOResult<()>> {
-        if !self.db_state.get().is_initialized() {
-            // 여러 쓰레드가 페이지 1 할당을 하려는 것을 방지
+        if !self.db_initialized() {
             if let Some(_lock) = self.init_lock.try_lock() {
-                match (self.db_state.get(), self.allocating_page1()) {
-                    (DbState::Uninitialized, false) | (DbState::Initializing, true) => {
-                        if let IOResult::IO(c) = self.allocate_page1()? {
-                            return Ok(IOResult::IO(c))
-                        } else {
-                            return Ok(IOResult::Done(()));
-                        }
-                    }
-                    _ => {}
+                if let IOResult::IO(c) = self.allocate_page1()? {
+                    return Ok(IOResult::IO(c));
+                } else {
+                    return Ok(IOResult::Done(()));
                 }
             } else {
+                // Give a chance for the allocation to happen elsewhere
                 io_yield_one!(Completion::new_yield());
             }
         }
@@ -382,10 +439,12 @@ impl Pager {
         let state = self.allocate_page1_state.read().clone();
         match state {
             AllocatePage1State::Start => {
+                assert!(!self.db_initialized());
                 tracing::trace!("allocate_page1(Start)");
 
-                self.db_state.set(DbState::Initializing);
-                let mut default_header = DatabaseHeader::default();
+                let IOResult::Done(mut default_header) = self.with_header(|header| *header)? else {
+                    panic!("DB should not be initialized and should not do any IO");
+                };
 
                 assert_eq!(default_header.database_size.get(), 0);
                 // page 1을 생성할 예정이므로 1로 변경
@@ -444,12 +503,134 @@ impl Pager {
                     GrainError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
                 })?;
 
-                self.db_state.set(DbState::Initialized);
+                self.init_page_1.store(None);
                 *self.allocate_page1_state.write() = AllocatePage1State::Done;
                 Ok(IOResult::Done(page.clone()))
             }
             AllocatePage1State::Done => unreachable!("cannot try to allocate page 1 again"),
         }
+    }
+
+    pub fn db_initialized(&self) -> bool {
+        self.init_page_1.load().is_none()
+    }
+
+    pub fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> Result<IOResult<T>> {
+        let header_ref = return_if_io!(HeaderRef::from_pager(self));
+        let header = header_ref.borrow();
+        // Update cached schema cookie when reading header
+        self.set_schema_cookie(Some(header.schema_cookie.get()));
+        Ok(IOResult::Done(f(header)))
+    }
+
+    /// Set the schema cookie cache.
+    pub fn set_schema_cookie(&self, cookie: Option<u32>) {
+        match cookie {
+            Some(value) => {
+                self.schema_cookie.store(value as u64, Ordering::SeqCst);
+            }
+            None => self
+                .schema_cookie
+                .store(Self::SCHEMA_COOKIE_NOT_SET, Ordering::SeqCst),
+        }
+    }
+
+    pub fn read_page(&self, page_idx: i64) -> Result<(PageRef, Option<Completion>)> {
+        assert!(page_idx >= 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
+        tracing::debug!("read_page(page_idx = {})", page_idx);
+        // 페이지 캐시 확인
+        let mut page_cache = self.page_cache.write();
+        let page_key = PageCacheKey::new(page_idx as usize);
+        if let Some(page) = page_cache.get(&page_key)? {
+            // 페이지가 캐시되어 있으면 캐시된 페이지 리턴
+            tracing::debug!("read_page(page_idx = {}) = cached", page_idx);
+            assert!(
+                page_idx as usize == page.get().id,
+                "attempted to read page {page_idx} but got page {}",
+                page.get().id
+            );
+            return Ok((page.clone(), None));
+        }
+        let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
+        assert!(
+            page_idx as usize == page.get().id,
+            "attempted to read page {page_idx} but got page {}",
+            page.get().id
+        );
+        self.cache_insert(page_idx as usize, page.clone(), &mut page_cache)?;
+        Ok((page, Some(c)))
+    }
+
+    /// WAL이나 DB file에서 페이지 읽기
+    pub fn read_page_no_cache(&self, page_idx: i64, frame_watermark: Option<u64>, allow_empty_read: bool) -> Result<(PageRef, Completion)> {
+        assert!(page_idx >= 0);
+        tracing::debug!("read_page_no_cache(page_idx = {})", page_idx);
+
+        let page = Arc::new(Page::new(page_idx));
+        let io_ctx = self.io_ctx.read();
+        let Some(wal) = self.wal.as_ref() else {
+            assert!(
+                matches!(frame_watermark, Some(0) | None),
+                "frame_watermark must be either None or Some(0) because DB has no WAL and read with other watermark is invalid"
+            );
+
+            page.set_locked();
+            let c = self.begin_read_disk_page(
+                page_idx as usize,
+                page.clone(),
+                allow_empty_read,
+                &io_ctx,
+            )?;
+            return Ok((page, c));
+        };
+
+        if let Some(frame_id) = wal.borrow().find_frame(page_idx as u64, frame_watermark)? {
+            let c = wal
+                .borrow()
+                .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
+            // TODO(pere) should probably first insert to page cache, and if successful,
+            // read frame or page
+            return Ok((page, c));
+        }
+
+        let c = self.begin_read_disk_page(page_idx as usize, page.clone(), allow_empty_read, &io_ctx)?;
+        Ok((page, c))
+    }
+
+    fn begin_read_disk_page(
+        &self,
+        page_idx: usize,
+        page: PageRef,
+        allow_empty_read: bool,
+        io_ctx: &IOContext,
+    ) -> Result<Completion> {
+        sqlite3_ondisk::begin_read_page(
+            self.db_file.as_ref(),
+            self.buffer_pool.clone(),
+            page,
+            page_idx,
+            allow_empty_read,
+            io_ctx,
+        )
+    }
+
+    /// 페이지를 페이지 캐시에 추가
+    /// 이미 같은 page id의 페이지가 있으면 에러
+    fn cache_insert(
+        &self,
+        page_idx: usize,
+        page: PageRef,
+        page_cache: &mut PageCache,
+    ) -> Result<()> {
+        let page_key = PageCacheKey::new(page_idx);
+        match page_cache.insert(page_key, page.clone()) {
+            Ok(_) => {}
+            Err(CacheError::KeyExists) => {
+                unreachable!("Page should not exist in cache after get() miss")
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
     }
 }
 
@@ -463,5 +644,32 @@ pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>, offset: us
         page.clear_wal_tag();
         page.get().contents = Some(PageContent::new(offset, buffer));
     }
+    page
+}
+
+pub fn default_page1() -> PageRef {
+    // new Database header for empty Database
+    let default_header = DatabaseHeader::default();
+    let page = Arc::new(Page::new(DatabaseHeader::PAGE_ID as i64));
+
+    let contents = PageContent::new(
+        0,
+        Arc::new(Buffer::new_temporary(
+            default_header.page_size.get() as usize
+        )),
+    );
+
+    contents.write_database_header(&default_header);
+    page.set_loaded();
+    page.clear_wal_tag();
+    page.get().contents.replace(contents);
+
+    btree_init_page(
+        &page,
+        PageType::TableLeaf,
+        DatabaseHeader::SIZE, // offset of 100 bytes
+        (default_header.page_size.get() - default_header.reserved_space as u32) as usize,
+    );
+
     page
 }

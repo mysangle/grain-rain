@@ -1,8 +1,9 @@
 
 use core::fmt::{self, Debug};
-use crate::CompletionError;
+use crate::{Buffer, CompletionError};
 use std::sync::{Arc, OnceLock};
 
+pub type ReadComplete = dyn Fn(Result<(Arc<Buffer>, i32), CompletionError>) + Send + Sync;
 pub type WriteComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
 
 #[must_use]
@@ -27,6 +28,16 @@ impl Completion {
         ))))
     }
 
+    pub fn new_read<F>(buf: Arc<Buffer>, complete: F) -> Self
+    where
+        F: Fn(Result<(Arc<Buffer>, i32), CompletionError>) + Send + Sync + 'static,
+    {
+        Self::new(CompletionType::Read(ReadCompletion::new(
+            buf,
+            Box::new(complete),
+        )))
+    }
+
     pub fn new_yield() -> Self {
         Self { inner: None }
     }
@@ -46,7 +57,7 @@ impl Completion {
         let inner = self.get_inner();
         inner.result.get_or_init(|| {
             match &inner.completion_type {
-                //CompletionType::Read(r) => r.callback(result),
+                CompletionType::Read(r) => r.callback(result),
                 CompletionType::Write(w) => w.callback(result),
                 //CompletionType::Sync(s) => s.callback(result), // fix
                 //CompletionType::Truncate(t) => t.callback(result),
@@ -56,6 +67,37 @@ impl Completion {
 
             result.err()
         });
+    }
+
+    /// Checks if the Completion completed or errored
+    pub fn finished(&self) -> bool {
+        match &self.inner {
+            Some(inner) => match &inner.completion_type {
+                //CompletionType::Group(g) => g.inner.outstanding.load(Ordering::SeqCst) == 0,
+                _ => inner.result.get().is_some(),
+            },
+            None => true,
+        }
+    }
+
+    pub fn failed(&self) -> bool {
+        match &self.inner {
+            Some(inner) => inner.result.get().is_some_and(|val| val.is_some()),
+            None => false,
+        }
+    }
+
+    pub fn error(&self, err: CompletionError) {
+        let result = Err(err);
+        self.callback(result);
+    }
+
+    pub fn as_read(&self) -> &ReadCompletion {
+        let inner = self.get_inner();
+        match inner.completion_type {
+            CompletionType::Read(ref r) => r,
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -86,13 +128,14 @@ impl CompletionInner {
 }
 
 pub enum CompletionType {
+    Read(ReadCompletion),
     Write(WriteCompletion),
 }
 
 impl Debug for CompletionType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            //Self::Read(..) => f.debug_tuple("Read").finish(),
+            Self::Read(..) => f.debug_tuple("Read").finish(),
             Self::Write(..) => f.debug_tuple("Write").finish(),
             //Self::Sync(..) => f.debug_tuple("Sync").finish(),
             //Self::Truncate(..) => f.debug_tuple("Truncate").finish(),
@@ -113,5 +156,28 @@ impl WriteCompletion {
 
     pub fn callback(&self, bytes_written: Result<i32, CompletionError>) {
         (self.complete)(bytes_written);
+    }
+}
+
+pub struct ReadCompletion {
+    pub buf: Arc<Buffer>,
+    pub complete: Box<ReadComplete>,
+}
+
+impl ReadCompletion {
+    pub fn new(buf: Arc<Buffer>, complete: Box<ReadComplete>) -> Self {
+        Self { buf, complete }
+    }
+
+    pub fn buf(&self) -> &Buffer {
+        &self.buf
+    }
+
+    pub fn callback(&self, bytes_read: Result<i32, CompletionError>) {
+        (self.complete)(bytes_read.map(|b| (self.buf.clone(), b)));
+    }
+
+    pub fn buf_arc(&self) -> Arc<Buffer> {
+        self.buf.clone()
     }
 }

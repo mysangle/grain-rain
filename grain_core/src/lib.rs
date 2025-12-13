@@ -16,7 +16,7 @@ use crate::{
         checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
         database::DatabaseFile,
         page_cache::PageCache,
-        pager::{AtomicDbState, DbState},
+        pager::{self, HeaderRef},
         sqlite3_ondisk::PageSize,
     },
     translate::emitter::TransactionMode,
@@ -28,9 +28,10 @@ pub use crate::{
     storage::{
         buffer_pool::BufferPool,
         database::{DatabaseStorage, IOContext},
-        pager::Pager,
+        pager::{Page, Pager},
         wal::{WalFile, WalFileShared},
     },
+    util::IOExt,
 };
 
 use grain_macros::AtomicEnum;
@@ -43,7 +44,7 @@ use std::{
     ops::Deref,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU16, Ordering},
         Arc,
     },
 };
@@ -74,11 +75,13 @@ pub struct Database {
     // write-ahead log
     shared_wal: Arc<RwLock<WalFileShared>>,
     mv_store: ArcSwapOption<MvStore>,
-    db_state: Arc<AtomicDbState>,
     buffer_pool: Arc<BufferPool>,
     _shared_page_cache: Arc<RwLock<PageCache>>,
     schema: Mutex<Arc<Schema>>,
     init_lock: Arc<Mutex<()>>,
+    // In Memory Page 1 for Empty Dbs
+    // db를 초기화하기 전에 사용. 초기화 된 후에는 None으로 설정
+    init_page_1: Arc<ArcSwapOption<Page>>,
 }
 
 /// Database 내부의 모든 필드가 Send, Sync가 아닐 수도 있지만
@@ -92,12 +95,43 @@ unsafe impl Sync for Database {}
 /// DatabaseStorage: IO에 의해 생성된 File을 내부에 가지고 있다.
 ///   - File에 대해 페이지 단위 접근
 impl Database {
-    pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        self._connect(false)
+    fn new(
+        path: impl Into<String>,
+        wal_path: impl Into<String>,
+        io: &Arc<dyn IO>,
+        db_file: Arc<dyn DatabaseStorage>,
+    ) -> Result<Self> {
+        let shared_wal = WalFileShared::new_noop();
+        let mv_store = ArcSwapOption::empty();
+        let db_size = db_file.size()?;
+        let shared_page_cache = Arc::new(RwLock::new(PageCache::default()));
+        let syms = SymbolTable::new();
+        let arena_size = BufferPool::DEFAULT_ARENA_SIZE;
+        let init_page_1 = if db_size == 0 {
+            let default_page_1 = pager::default_page1();
+            Some(default_page_1)
+        } else {
+            None
+        };
+
+        let db = Database {
+            path: path.into(),
+            wal_path: wal_path.into(),
+            io: io.clone(),
+            db_file,
+            shared_wal,
+            mv_store,
+            buffer_pool: BufferPool::begin_init(&io, arena_size),
+            _shared_page_cache: shared_page_cache.clone(),
+            schema: Mutex::new(Arc::new(Schema::new())),
+            init_lock: Arc::new(Mutex::new(())),
+            init_page_1: Arc::new(ArcSwapOption::new(init_page_1)),
+        };
+        Ok(db)
     }
 
-    pub(crate) fn connect_mvcc_bootstrap(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        self._connect(true)
+    pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
+        self._connect(false, None)
     }
 
     pub fn open_new(path: &str) -> Result<(Arc<dyn IO>, Arc<Database>)> {
@@ -127,7 +161,9 @@ impl Database {
     }
 
     fn open_with_internal(io: Arc<dyn IO>, path: &str, wal_path: &str, db_file: Arc<dyn DatabaseStorage>) -> Result<Arc<Database>> {
-        // WAL 파일 초기화
+        let mut db = Self::new(path, wal_path, &io, db_file)?;
+
+        // WAL 파일이 있으면 읽기
         let shared_wal = WalFileShared::open_shared_if_exists(&io, path)?;
 
         // MVCC 초기화
@@ -136,61 +172,74 @@ impl Database {
             let file = io.open_file(&format!("{path}-log"), false)?;
             let storage = mvcc::persistent_storage::Storage::new(file);
             let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
-            ArcSwapOption::new(Some(Arc::new(mv_store)))
+            Some(Arc::new(mv_store))
         };
 
-        let db_size = db_file.size()?;
-        let db_state = if db_size == 0 {
-            DbState::Uninitialized
-        } else {
-            DbState::Initialized
-        };
-        let shared_page_cache = Arc::new(RwLock::new(PageCache::default()));
-        let arena_size = BufferPool::DEFAULT_ARENA_SIZE;
+        db.shared_wal = shared_wal;
+        db.mv_store.store(mv_store);
 
-        let db = Arc::new(Database {
-            path: path.to_string(),
-            wal_path: wal_path.to_string(),
-            io: io.clone(),
-            db_file,
-            shared_wal,
-            mv_store,
-            db_state: Arc::new(AtomicDbState::new(db_state)),
-            buffer_pool: BufferPool::begin_init(&io, arena_size),
-            _shared_page_cache: shared_page_cache.clone(),
-            schema: Mutex::new(Arc::new(Schema::new())),
-            init_lock: Arc::new(Mutex::new(())),
-        });
+        let db = Arc::new(db);
 
-        if db_state.is_initialized() {
-            // TODO: 파일이 이미 있는 경우 내용을 읽기
-            let conn = db.connect()?;
-        }
+        let conn = db.connect()?;
+        let syms = conn.syms.read();
+        let pager = conn.pager.load().clone();
+
+        // db.with_schema_mut(|schema| {
+        //     let header_schema_cookie = pager
+        //         .io
+        //         .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
+        //     schema.schema_version = header_schema_cookie;
+        //     let result = schema
+        //         .make_from_btree(None, pager.clone(), &syms)
+        //         .inspect_err(|_| pager.end_read_tx());
+        //     match result {
+        //         Err(GrainError::ExtensionError(e)) => {
+        //             // this means that a vtab exists and we no longer have the module loaded. we print
+        //             // a warning to the user to load the module
+        //             eprintln!("Warning: {e}");
+        //         }
+        //         Err(e) => return Err(e),
+        //         _ => {}
+        //     }
+
+        //     Ok(())
+        // })?;
 
         {
             let mv_store = db.get_mv_store();
             let mv_store = mv_store.as_ref().unwrap();
-            let mvcc_bootstrap_conn = db.connect_mvcc_bootstrap()?;
+            let mvcc_bootstrap_conn = db._connect(true, None)?;
             mv_store.bootstrap(mvcc_bootstrap_conn)?;
         }
         
         Ok(db)
     }
 
-    fn _connect(self: &Arc<Database>, is_mvcc_bootstrap_connection: bool) -> Result<Arc<Connection>> {
-        let pager = self.init_pager(None)?;
-        let pager = Arc::new(pager);
+    // #[inline]
+    // pub(crate) fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> Result<T>) -> Result<T> {
+    //     let mut schema_ref = self.schema.lock();
+    //     let schema = Arc::make_mut(&mut *schema_ref);
+    //     f(schema)
+    // }
 
-        if self.db_state.get().is_initialized() {
-            // TODO: 데이터베이스 파일이 이미 있는 경우 vacuum mode 확인
-        }
-
+    fn _connect(self: &Arc<Database>, is_mvcc_bootstrap_connection: bool, pager: Option<Arc<Pager>>) -> Result<Arc<Connection>> {
+        let pager = if let Some(pager) = pager {
+            pager
+        } else {
+            self._init()?
+        };
         let page_size = pager.get_page_size_unchecked();
+        let default_cache_size = pager
+            .io
+            .block(|| pager.with_header(|header| header.default_page_cache_size))
+            .unwrap_or_default()
+            .get();
 
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: ArcSwap::new(pager),
             schema: RwLock::new(self.schema.lock().clone()),
+            cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),
             syms: RwLock::new(SymbolTable::new()),
             mv_tx: RwLock::new(None),
@@ -200,6 +249,17 @@ impl Database {
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
         });
         Ok(conn)
+    }
+
+    fn _init(&self) -> Result<Arc<Pager>> {
+        let pager = self.init_pager(None)?;
+        let pager = Arc::new(pager);
+
+        // TODO: auto vacuum
+        // let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
+        // let header = header_ref.borrow();
+
+        Ok(pager)
     }
 
     fn read_page_size_from_db_header(&self) -> Result<PageSize> {
@@ -231,7 +291,7 @@ impl Database {
                 return Ok(page_size);
             }
         }
-        if self.db_state.get().is_initialized() {
+        if self.initialized() {
             Ok(self.read_page_size_from_db_header()?)
         } else {
             let Some(size) = requested_page_size else {
@@ -246,7 +306,7 @@ impl Database {
 
     /// 데이터베이스 파일이 초기화가 안된 시점에는 None을 리턴
     fn maybe_get_reserved_space_bytes(&self) -> Result<Option<u8>> {
-        if self.db_state.get().is_initialized() {
+        if self.initialized() {
             Ok(Some(self.read_reserved_space_bytes_from_db_header()?))
         } else {
             Ok(None)
@@ -272,10 +332,9 @@ impl Database {
             drop(shared_wal);
 
             let buffer_pool = self.buffer_pool.clone();
-            if self.db_state.get().is_initialized() {
+            if self.initialized() {
                 buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
             }
-            let db_state = self.db_state.clone();
             let wal = Rc::new(RefCell::new(WalFile::new(
                 self.io.clone(),
                 self.shared_wal.clone(),
@@ -286,9 +345,9 @@ impl Database {
                 Some(wal),
                 self.io.clone(),
                 Arc::new(RwLock::new(PageCache::default())),
-                db_state,
                 buffer_pool.clone(),
                 self.init_lock.clone(),
+                self.init_page_1.clone(),
             )?;
             pager.set_page_size(page_size);
             if let Some(reserved_bytes) = reserved_bytes {
@@ -307,19 +366,18 @@ impl Database {
 
         let buffer_pool = self.buffer_pool.clone();
 
-        if self.db_state.get().is_initialized() {
+        if self.initialized() {
             buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
         }
 
-        let db_state = self.db_state.clone();
         let mut pager = Pager::new(
             self.db_file.clone(),
             None,
             self.io.clone(),
             Arc::new(RwLock::new(PageCache::default())),
-            db_state,
             buffer_pool.clone(),
             self.init_lock.clone(),
+            self.init_page_1.clone(),
         )?;
 
         pager.set_page_size(page_size);
@@ -344,6 +402,11 @@ impl Database {
 
         Ok(pager)
     }
+
+    #[inline]
+    pub(crate) fn initialized(&self) -> bool {
+        self.init_page_1.load().is_none()
+    }
 }
 
 /// Connection에서는 한번에 하나의 트랜잭션만 가능하게 동작한다.
@@ -351,6 +414,7 @@ pub struct Connection {
     db: Arc<Database>,
     pager: ArcSwap<Pager>,
     schema: RwLock<Arc<Schema>>,
+    cache_size: AtomicI32,
     page_size: AtomicU16,
     syms: RwLock<SymbolTable>,
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,

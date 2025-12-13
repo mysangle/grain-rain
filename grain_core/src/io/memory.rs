@@ -62,6 +62,48 @@ pub struct MemoryFile {
 unsafe impl Sync for MemoryFile {}
 
 impl File for MemoryFile {
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+        tracing::debug!("pread(path={}): pos={}", self.path, pos);
+        let r = c.as_read();
+        let buf_len = r.buf().len() as u64;
+        if buf_len == 0 {
+            c.complete(0);
+            return Ok(c);
+        }
+
+        let file_size = self.size.get();
+        if pos >= file_size {
+            c.complete(0);
+            return Ok(c);
+        }
+
+        let read_len = buf_len.min(file_size - pos);
+        {
+            let read_buf = r.buf();
+            let mut offset = pos as usize;
+            let mut remaining = read_len as usize;
+            let mut buf_offset = 0;
+
+            while remaining > 0 {
+                let page_no = offset / PAGE_SIZE;
+                let page_offset = offset % PAGE_SIZE;
+                let bytes_to_read = remaining.min(PAGE_SIZE - page_offset);
+                if let Some(page) = self.get_page(page_no) {
+                    read_buf.as_mut_slice()[buf_offset..buf_offset + bytes_to_read]
+                        .copy_from_slice(&page[page_offset..page_offset + bytes_to_read]);
+                } else {
+                    read_buf.as_mut_slice()[buf_offset..buf_offset + bytes_to_read].fill(0);
+                }
+
+                offset += bytes_to_read;
+                buf_offset += bytes_to_read;
+                remaining -= bytes_to_read;
+            }
+        }
+        c.complete(read_len as i32);
+        Ok(c)
+    }
+
     fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
         tracing::debug!(
             "pwrite(path={}): pos={}, size={}",
@@ -118,5 +160,9 @@ impl MemoryFile {
                 .entry(page_no as usize)
                 .or_insert_with(|| Box::new([0; PAGE_SIZE]))
         }
+    }
+
+    fn get_page(&self, page_no: usize) -> Option<&MemPage> {
+        unsafe { (*self.pages.get()).get(&page_no) }
     }
 }

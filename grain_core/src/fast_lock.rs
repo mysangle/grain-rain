@@ -29,6 +29,8 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
     }
 }
 
+unsafe impl<T> Sync for SpinLock<T> {}
+
 #[derive(Debug)]
 pub struct SpinLock<T> {
     locked: AtomicBool,

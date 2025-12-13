@@ -73,6 +73,10 @@ pub enum BTreeKey<'a> {
 }
 
 impl BTreeKey<'_> {
+    pub fn new_table_rowid(rowid: i64, record: Option<&ImmutableRecord>) -> BTreeKey<'_> {
+        BTreeKey::TableRowId((rowid, record))
+    }
+    
     pub fn get_record(&self) -> Option<&'_ ImmutableRecord> {
         match self {
             BTreeKey::TableRowId((_, record)) => *record,
@@ -90,6 +94,7 @@ impl BTreeKey<'_> {
 
 /// Any 는 런타임에 타입을 식별하거나 다운캐스팅할 수 있도록 해주는 트레잇
 pub trait CursorTrait: Any {
+    fn last(&mut self) -> Result<IOResult<()>>;
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>>;
 }
 
@@ -109,7 +114,7 @@ pub struct BTreeCursor {
 
 impl BTreeCursor {
     pub fn new(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
-        let valid_state = if root_page == 1 && !pager.db_state.get().is_initialized() {
+        let valid_state = if root_page == 1 && !pager.db_initialized() {
             CursorValidState::Invalid
         } else {
             CursorValidState::Valid
@@ -139,6 +144,8 @@ impl BTreeCursor {
             self.state = CursorState::Write(WriteState::Start);
         }
         let usable_space = self.usable_space();
+
+        return Ok(IOResult::Done(()));
     }
 
     pub fn is_write_in_progress(&self) -> bool {
@@ -152,6 +159,10 @@ impl BTreeCursor {
 }
 
 impl CursorTrait for BTreeCursor {
+    fn last(&mut self) -> Result<IOResult<()>> {
+
+    }
+
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
         // ?는 Debug 출력을 하라는 의미
         tracing::debug!(

@@ -1,5 +1,5 @@
 
-use crate::Result;
+use crate::{CompletionError, Result};
 
 const CHECKSUM_PAGE_SIZE: usize = 4096;
 const CHECKSUM_SIZE: usize = 8;
@@ -27,6 +27,36 @@ impl ChecksumContext {
         let checksum_bytes = checksum.to_le_bytes();
         assert_eq!(checksum_bytes.len(), CHECKSUM_SIZE);
         page[CHECKSUM_PAGE_SIZE - CHECKSUM_SIZE..].copy_from_slice(&checksum_bytes);
+        Ok(())
+    }
+
+    pub fn verify_checksum(
+        &self,
+        page: &mut [u8],
+        page_id: usize,
+    ) -> std::result::Result<(), CompletionError> {
+        if page.len() != CHECKSUM_PAGE_SIZE {
+            return Ok(());
+        }
+
+        let actual_page = &page[..CHECKSUM_PAGE_SIZE - CHECKSUM_SIZE];
+        let stored_checksum_bytes = &page[CHECKSUM_PAGE_SIZE - CHECKSUM_SIZE..];
+        let stored_checksum = u64::from_le_bytes(stored_checksum_bytes.try_into().unwrap());
+
+        let computed_checksum = self.compute_checksum(actual_page);
+        if stored_checksum != computed_checksum {
+            tracing::error!(
+                "Checksum mismatch on page {}: expected {:x}, got {:x}",
+                page_id,
+                stored_checksum,
+                computed_checksum
+            );
+            return Err(CompletionError::ChecksumMismatch {
+                page_id,
+                expected: stored_checksum,
+                actual: computed_checksum,
+            });
+        }
         Ok(())
     }
 

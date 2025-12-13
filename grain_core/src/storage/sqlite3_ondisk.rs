@@ -1,15 +1,17 @@
 
 use bytemuck::{Pod, Zeroable};
 use crate::{
-    io::{Buffer, Completion},
+    io::{Buffer, Completion, ReadComplete},
     storage::{
         btree::offset::{
             BTREE_CELL_CONTENT_AREA, BTREE_CELL_COUNT, BTREE_FIRST_FREEBLOCK,
             BTREE_FRAGMENTED_BYTES_COUNT, BTREE_PAGE_TYPE, BTREE_RIGHTMOST_PTR,
         },
+        buffer_pool::BufferPool,
+        database::{DatabaseStorage, EncryptionOrChecksum},
         pager::Pager,
     },
-    CompletionError, Result,
+    CompletionError, File, IOContext, Result,
 };
 use pack1::{I32BE, U16BE, U32BE};
 use std::sync::Arc;
@@ -396,4 +398,108 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
     let c = Completion::new_write(write_complete);
     let io_ctx = pager.io_ctx.read();
     page_source.write_page(page_id, buffer.clone(), &io_ctx, c)
+}
+
+pub fn begin_read_page(
+    db_file: &dyn DatabaseStorage,
+    buffer_pool: Arc<BufferPool>,
+    page: PageRef,
+    page_idx: usize,
+    allow_empty_read: bool,
+    io_ctx: &IOContext,
+) -> Result<Completion> {
+    tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
+    let buf = buffer_pool.get_page();
+    let buf = Arc::new(buf);
+    let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+        let Ok((mut buf, bytes_read)) = res else {
+            page.clear_locked();
+            return;
+        };
+        let buf_len = buf.len();
+        assert!(
+            (allow_empty_read && bytes_read == 0) || bytes_read == buf_len as i32,
+            "read({bytes_read}) != expected({buf_len})"
+        );
+        let page = page.clone();
+        if bytes_read == 0 {
+            buf = Arc::new(Buffer::new_temporary(0));
+        }
+        finish_read_page(page_idx, buf, page.clone());
+    });
+    let c = Completion::new_read(buf, complete);
+    db_file.read_page(page_idx, io_ctx, c)
+}
+
+pub fn finish_read_page(page_idx: usize, buffer_ref: Arc<Buffer>, page: PageRef) {
+    tracing::trace!("finish_read_page(page_idx = {page_idx})");
+    let pos = if page_idx == DatabaseHeader::PAGE_ID {
+        // page 1은 데이터베이스 헤더를 앞에 포함하고 있다.
+        DatabaseHeader::SIZE
+    } else {
+        0
+    };
+    let inner = PageContent::new(pos, buffer_ref.clone());
+    {
+        page.get().contents.replace(inner);
+        page.clear_locked();
+        page.set_loaded();
+        // we set the wal tag only when reading page from log, or in allocate_page,
+        // we clear it here for safety in case page is being re-loaded.
+        page.clear_wal_tag();
+    }
+}
+
+pub fn begin_read_wal_frame<F: File + ?Sized>(
+    io: &F,
+    offset: u64,
+    buffer_pool: Arc<BufferPool>,
+    complete: Box<ReadComplete>,
+    page_idx: usize,
+    io_ctx: &IOContext,
+) -> Result<Completion> {
+    tracing::trace!(
+        "begin_read_wal_frame(offset={}, page_idx={})",
+        offset,
+        page_idx
+    );
+    let buf = buffer_pool.get_page();
+    let buf = Arc::new(buf);
+
+    match io_ctx.encryption_or_checksum() {
+        EncryptionOrChecksum::Checksum(ctx) => {
+            let checksum_ctx = ctx.clone();
+            let original_c = complete;
+            let verify_complete =
+                Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                    let Ok((buf, bytes_read)) = res else {
+                        original_c(res);
+                        return;
+                    };
+                    if bytes_read <= 0 {
+                        tracing::trace!("Read page {page_idx} with {} bytes", bytes_read);
+                        original_c(Ok((buf, bytes_read)));
+                        return;
+                    }
+
+                    match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx) {
+                        Ok(_) => {
+                            original_c(Ok((buf, bytes_read)));
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to verify checksum for page_id={page_idx}: {e}"
+                            );
+                            original_c(Err(e))
+                        }
+                    }
+                });
+            let c = Completion::new_read(buf, verify_complete);
+            io.pread(offset, c)
+        }
+        EncryptionOrChecksum::None => {
+            let c = Completion::new_read(buf, complete);
+            io.pread(offset, c)
+        }
+    }
 }

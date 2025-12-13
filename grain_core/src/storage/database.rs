@@ -3,11 +3,13 @@ use crate::{
     error::GrainError,
     io::Completion,
     storage::checksum::ChecksumContext,
-    Buffer, Result,
+    Buffer, CompletionError, Result,
 };
 use std::sync::Arc;
 
 pub trait DatabaseStorage: Send + Sync {
+    fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion>;
+
     fn write_page(&self, page_idx: usize, buffer: Arc<Buffer>, io_ctx: &IOContext, c: Completion,) -> Result<Completion>;
 
     fn size(&self) -> Result<u64>;
@@ -25,6 +27,58 @@ impl DatabaseFile {
 }
 
 impl DatabaseStorage for DatabaseFile {
+    fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion> {
+        assert!(page_idx as i64 >= 0, "page should be positive");
+        let r = c.as_read();
+        let size = r.buf().len();
+        assert!(page_idx > 0);
+        if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
+            return Err(GrainError::NotADB);
+        }
+        let Some(pos) = (page_idx as u64 - 1).checked_mul(size as u64) else {
+            return Err(GrainError::IntegerOverflow);
+        };
+
+        match &io_ctx.encryption_or_checksum {
+            EncryptionOrChecksum::Checksum(ctx) => {
+                let checksum_ctx = ctx.clone();
+                let read_buffer = r.buf_arc();
+                let original_c = c.clone();
+
+                let verify_complete =
+                    Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                        let Ok((buf, bytes_read)) = res else {
+                            return;
+                        };
+                        if bytes_read <= 0 {
+                            tracing::trace!("Read page {page_idx} with {} bytes", bytes_read);
+                            original_c.complete(bytes_read);
+                            return;
+                        }
+                        match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx) {
+                            Ok(_) => {
+                                original_c.complete(bytes_read);
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to verify checksum for page_id={page_idx}: {e}"
+                                );
+                                assert!(
+                                    !original_c.failed(),
+                                    "Original completion already has an error"
+                                );
+                                original_c.error(e);
+                            }
+                        }
+                    });
+
+                let wrapped_completion = Completion::new_read(read_buffer, verify_complete);
+                self.file.pread(pos, wrapped_completion)
+            }
+            EncryptionOrChecksum::None => self.file.pread(pos, c),
+        }
+    }
+
     fn write_page(&self, page_idx: usize, buffer: Arc<Buffer>, io_ctx: &IOContext, c: Completion,) -> Result<Completion> {
         let buffer_size = buffer.len();
         assert!(page_idx > 0);
@@ -68,6 +122,10 @@ impl IOContext {
             EncryptionOrChecksum::Checksum(ctx) => ctx.required_reserved_bytes(),
             EncryptionOrChecksum::None => Default::default(),
         }
+    }
+
+    pub fn encryption_or_checksum(&self) -> &EncryptionOrChecksum {
+        &self.encryption_or_checksum
     }
 }
 

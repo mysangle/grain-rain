@@ -1,5 +1,9 @@
 
-use crate::io::Completion;
+use crate::{
+    io::Completion,
+    storage::btree::CursorTrait,
+    IO, Result,
+};
 use serde::Deserialize;
 use std::{
     borrow::{Borrow, Cow},
@@ -21,6 +25,15 @@ pub enum IOResult<T> {
 #[must_use]
 pub enum IOCompletions {
     Single(Completion),
+}
+
+impl IOCompletions {
+    /// Wais for the Completions to complete
+    pub fn wait<I: ?Sized + IO>(self, io: &I) -> Result<()> {
+        match self {
+            IOCompletions::Single(c) => io.wait_for_completion(c),
+        }
+    }
 }
 
 #[macro_export]
@@ -288,6 +301,17 @@ pub struct ImmutableRecord {
     payload: Value,
 }
 
+impl ImmutableRecord {
+    pub fn get_values<'a>(&'a self) -> Vec<ValueRef<'a>> {
+        // let mut cursor = RecordCursor::new();
+        // cursor
+        //     .get_values(self)
+        //     .collect::<Result<Vec<_>>>()
+        //     .unwrap_or_default()
+        vec![]
+    }
+}
+
 impl std::fmt::Debug for ImmutableRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.payload {
@@ -350,3 +374,21 @@ fn sqlite_int_float_compare(int_val: i64, float_val: f64) -> std::cmp::Ordering 
         other => other,
     }
 }
+
+pub enum Cursor {
+    BTree(Box<dyn CursorTrait>),
+}
+
+impl Cursor {
+    pub fn new_btree(cursor: Box<dyn CursorTrait>) -> Self {
+        Self::BTree(cursor)
+    }
+
+    pub fn as_btree_mut(&mut self) -> &mut dyn CursorTrait {
+        match self {
+            Self::BTree(cursor) => cursor.as_mut(),
+            //_ => panic!("Cursor is not a btree"),
+        }
+    }
+}
+
