@@ -94,8 +94,10 @@ impl BTreeKey<'_> {
 
 /// Any 는 런타임에 타입을 식별하거나 다운캐스팅할 수 있도록 해주는 트레잇
 pub trait CursorTrait: Any {
+    fn rowid(&self) -> Result<IOResult<Option<i64>>>;
     fn last(&mut self) -> Result<IOResult<()>>;
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>>;
+    fn seek_to_last(&mut self, always_seek: bool) -> Result<IOResult<()>>;
 }
 
 pub struct BTreeCursor {
@@ -159,8 +161,12 @@ impl BTreeCursor {
 }
 
 impl CursorTrait for BTreeCursor {
-    fn last(&mut self) -> Result<IOResult<()>> {
+    fn rowid(&self) -> Result<IOResult<Option<i64>>> {
 
+    }
+    
+    fn last(&mut self) -> Result<IOResult<()>> {
+        
     }
 
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
@@ -177,6 +183,10 @@ impl CursorTrait for BTreeCursor {
             self.has_record.replace(true);
         }
         Ok(IOResult::Done(()))
+    }
+
+    fn seek_to_last(&mut self, always_seek: bool) -> Result<IOResult<()>> {
+
     }
 }
 

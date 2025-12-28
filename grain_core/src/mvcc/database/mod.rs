@@ -9,17 +9,23 @@ use crate::{
         sqlite3_ondisk::DatabaseHeader,
         wal::GrainRwLock,
     },
+    types::{ImmutableRecord, IndexInfo},
     Connection, GrainError, IOExt, Result, Pager,
 };
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use parking_lot::RwLock;
-use std::sync::{
-    atomic::{AtomicI64, AtomicU64, Ordering},
-    Arc,
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 const NO_EXCLUSIVE_TX: u64 = 0;
 pub const SQLITE_SCHEMA_MVCC_TABLE_ID: MVTableId = MVTableId(-1);
+pub const LOGICAL_LOG_RECOVERY_TRANSACTION_ID: u64 = 0;
+pub const LOGICAL_LOG_RECOVERY_COMMIT_TIMESTAMP: u64 = 0;
 
 /// MVCC의 테이블 ID
 /// 항상 음수이다.
@@ -47,11 +53,64 @@ impl From<MVTableId> for i64 {
     }
 }
 
+/// Wrapper for index keys that implements collation-aware, ASC/DESC-aware ordering.
+#[derive(Debug, Clone)]
+pub struct SortableIndexKey {
+    pub key: ImmutableRecord,
+    pub metadata: Arc<IndexInfo>,
+}
+
+impl SortableIndexKey {
+    pub fn new_from_record(key: ImmutableRecord, metadata: Arc<IndexInfo>) -> Self {
+        Self { key, metadata }
+    }
+}
+
+impl PartialEq for SortableIndexKey {
+    fn eq(&self, other: &Self) -> bool {
+        if self.key == other.key {
+            return true;
+        }
+
+        self.compare(other)
+            .map(|ord| ord == std::cmp::Ordering::Equal)
+            .unwrap_or(false)
+    }
+}
+
+impl Eq for SortableIndexKey {}
+
+impl PartialOrd for SortableIndexKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SortableIndexKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.compare(other).expect("Failed to compare IndexKeys")
+    }
+}
+
 pub type TxID = u64;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RowKey {
+    Int(i64),
+    Record(SortableIndexKey),
+}
 
+impl RowKey {
+    pub fn to_int_or_panic(&self) -> i64 {
+        match self {
+            RowKey::Int(row_id) => *row_id,
+            _ => panic!("RowKey is not an integer"),
+        }
+    }
+
+    pub fn is_int_key(&self) -> bool {
+        matches!(self, RowKey::Int(_))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,6 +118,12 @@ pub struct RowID {
     /// The table ID. Analogous to table's root page number.
     pub table_id: MVTableId,
     pub row_id: RowKey,
+}
+
+impl RowID {
+    pub fn new(table_id: MVTableId, row_id: RowKey) -> Self {
+        Self { table_id, row_id }
+    }
 }
 
 impl PartialOrd for RowID {
@@ -77,6 +142,131 @@ impl Ord for RowID {
             ord => ord,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
+pub struct Row {
+    pub id: RowID,
+    /// Data is None for index rows because the key holds all the data.
+    pub data: Option<Vec<u8>>,
+    pub column_count: usize,
+}
+
+impl Row {
+    pub fn new_table_row(id: RowID, data: Vec<u8>, column_count: usize) -> Self {
+        Self {
+            id,
+            data: Some(data),
+            column_count,
+        }
+    }
+
+    pub fn new_index_row(id: RowID, column_count: usize) -> Self {
+        Self {
+            id,
+            data: None,
+            column_count,
+        }
+    }
+}
+
+/// A row version.
+/// TODO: we can optimize this by using bitpacking for the begin and end fields.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowVersion {
+    pub begin: Option<TxTimestampOrID>,
+    pub end: Option<TxTimestampOrID>,
+    pub row: Row,
+    /// Indicates this version was created for a row that existed in B-tree before
+    /// MVCC was enabled (e.g., after switching from WAL to MVCC journal mode).
+    /// This flag helps the checkpoint logic determine if a delete should be
+    /// checkpointed to the B-tree file.
+    pub btree_resident: bool,
+}
+
+impl RowVersion {
+    pub fn is_visible_to(&self, tx: &Transaction, txs: &SkipMap<TxID, Transaction>) -> bool {
+        is_begin_visible(txs, tx, self) && is_end_visible(txs, tx, self)
+    }
+}
+
+fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &RowVersion) -> bool {
+    match rv.begin {
+        Some(TxTimestampOrID::Timestamp(rv_begin_ts)) => tx.begin_ts >= rv_begin_ts,
+        Some(TxTimestampOrID::TxID(rv_begin)) => {
+            let tb = txs
+                .get(&rv_begin)
+                .expect("transaction should exist in txs map");
+            let tb = tb.value();
+            let visible = match tb.state.load() {
+                TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
+                TransactionState::Preparing => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
+                TransactionState::Committed(committed_ts) => tx.begin_ts >= committed_ts,
+                TransactionState::Aborted => false,
+                TransactionState::Terminated => {
+                    tracing::debug!("TODO: should reread rv's end field - it should have updated the timestamp in the row version by now");
+                    false
+                }
+            };
+            tracing::trace!(
+                "is_begin_visible: tx={tx}, tb={tb} rv = {:?}-{:?} visible = {visible}",
+                rv.begin,
+                rv.end
+            );
+            visible
+        }
+        None => false,
+    }
+}
+
+fn is_end_visible(
+    txs: &SkipMap<TxID, Transaction>,
+    current_tx: &Transaction,
+    row_version: &RowVersion,
+) -> bool {
+    match row_version.end {
+        Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.begin_ts < rv_end_ts,
+        Some(TxTimestampOrID::TxID(rv_end)) => {
+            let other_tx = txs
+                .get(&rv_end)
+                .unwrap_or_else(|| panic!("Transaction {rv_end} not found"));
+            let other_tx = other_tx.value();
+            let visible = match other_tx.state.load() {
+                // V's sharp mind discovered an issue with the hekaton paper which basically states that a
+                // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
+                // Source: https://avi.im/blag/2023/hekaton-paper-typo/
+                TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
+                TransactionState::Preparing => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
+                TransactionState::Committed(committed_ts) => current_tx.begin_ts < committed_ts,
+                TransactionState::Aborted => false,
+                TransactionState::Terminated => {
+                    tracing::debug!("TODO: should reread rv's end field - it should have updated the timestamp in the row version by now");
+                    false
+                }
+            };
+            tracing::trace!(
+                "is_end_visible: tx={current_tx}, te={other_tx} rv = {:?}-{:?}  visible = {visible}",
+                row_version.begin,
+                row_version.end
+            );
+            visible
+        }
+        None => true,
+    }
+}
+
+/// A transaction timestamp or ID.
+///
+/// Versions either track a timestamp or a transaction ID, depending on the
+/// phase of the transaction. During the active phase, new versions track the
+/// transaction ID in the `begin` and `end` fields. After a transaction commits,
+/// versions switch to tracking timestamps.
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
+pub enum TxTimestampOrID {
+    /// A committed transaction's timestamp.
+    Timestamp(u64),
+    /// The ID of a non-committed transaction.
+    TxID(TxID),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -147,6 +337,19 @@ impl std::cmp::PartialEq<TransactionState> for AtomicTransactionState {
     }
 }
 
+
+impl std::fmt::Display for TransactionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        match self {
+            TransactionState::Active => write!(f, "Active"),
+            TransactionState::Preparing => write!(f, "Preparing"),
+            TransactionState::Committed(ts) => write!(f, "Committed({ts})"),
+            TransactionState::Aborted => write!(f, "Aborted"),
+            TransactionState::Terminated => write!(f, "Terminated"),
+        }
+    }
+}
+
 impl AtomicTransactionState {
     fn store(&self, state: TransactionState) {
         self.state.store(state.encode(), Ordering::Release);
@@ -184,6 +387,43 @@ impl Transaction {
             header: RwLock::new(header),
         }
     }
+
+    fn insert_to_read_set(&self, id: RowID) {
+        self.read_set.insert(id);
+    }
+
+    fn insert_to_write_set(&self, id: RowID) {
+        self.write_set.insert(id);
+    }
+}
+
+impl std::fmt::Display for Transaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        write!(
+            f,
+            "{{ state: {}, id: {}, begin_ts: {}, write_set: [",
+            self.state.load(),
+            self.tx_id,
+            self.begin_ts,
+        )?;
+
+        for (i, v) in self.write_set.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?
+            }
+            write!(f, "{:?}", *v.value())?;
+        }
+
+        write!(f, "], read_set: [")?;
+        for (i, v) in self.read_set.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{:?}", *v.value())?;
+        }
+
+        write!(f, "] }}")
+    }
 }
 
 #[derive(Debug)]
@@ -191,9 +431,85 @@ struct CommitCoordinator {
     pager_commit_lock: Arc<GrainRwLock>,
 }
 
+/// 테이블에 대한 행 ID(row ID) 할당을 관리
+#[derive(Debug)]
+pub struct RowidAllocator {
+    /// Lock to ensure that only one thread can initialize the rowid allocator at a time.
+    /// In case of unitialized values, we will look for last rowid first.
+    lock: GrainRwLock,
+    /// last_rowid is the last rowid that was allocated.
+    /// 테이블에 대해 현재까지 할당된 가장 큰 행 ID를 저장
+    max_rowid: RwLock<Option<i64>>,
+    /// 초기 설정을 완료했는지 여부
+    initialized: AtomicBool,
+}
+
+impl RowidAllocator {
+    /// 이전 max row id와 1 증가한 새 row id를 리턴
+    pub fn get_next_rowid(&self) -> Option<(i64, Option<i64>)> {
+        let mut last_rowid_guard = self.max_rowid.write();
+        if last_rowid_guard.is_none() {
+            // Case 1. Table is empty
+            // Database is empty because there is no last rowid
+            *last_rowid_guard = Some(1);
+            tracing::trace!("get_next_rowid(empty, 1)");
+            Some((1, None))
+        } else {
+            // Case 2. Table is not empty
+            let last_rowid = last_rowid_guard.unwrap();
+            if last_rowid == i64::MAX {
+                // 이미 값이 max에 다다랐으면 None을 리턴한다.
+                tracing::trace!("get_next_rowid(max)");
+                None
+            } else {
+                let next_rowid = last_rowid + 1;
+                // 이전 row id에서 1 증가한 값을 저장
+                *last_rowid_guard = Some(next_rowid);
+                tracing::trace!("get_next_rowid({next_rowid})");
+                Some((next_rowid, Some(last_rowid)))
+            }
+        }
+    }
+
+    /// 새로운 rowid를 insert한 경우 last_rowid를 업데이트 해준다.
+    pub fn insert_row_id_maybe_update(&self, rowid: i64) {
+        let mut last_rowid = self.max_rowid.write();
+        if let Some(last_rowid) = last_rowid.as_mut() {
+            *last_rowid = (*last_rowid).max(rowid);
+        } else {
+            *last_rowid = Some(rowid);
+        }
+    }
+
+    pub fn is_uninitialized(&self) -> bool {
+        !self.initialized.load(Ordering::SeqCst)
+    }
+
+    pub fn initialize(&self, rowid: Option<i64>) {
+        tracing::trace!("initialize({rowid:?})");
+
+        let mut last_rowid = self.max_rowid.write();
+        *last_rowid = rowid;
+        self.initialized.store(true, Ordering::SeqCst);
+    }
+
+    pub fn lock(&self) -> bool {
+        self.lock.write()
+    }
+
+    pub fn unlock(&self) {
+        self.lock.unlock()
+    }
+}
+
 /// SkipMap: lock-free(또는 very-low-contention) 정렬 맵(sorted map)
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock> {
+    pub rows: SkipMap<RowID, RwLock<Vec<RowVersion>>>,
+    /// Unlike table rows which are stored in a single map, we have a separate map for every index
+    /// because operations like last() on an index are much easier when we don't have to take the
+    /// table identifier into account.
+    pub index_rows: SkipMap<MVTableId, SkipMap<SortableIndexKey, RwLock<Vec<RowVersion>>>>,
     pub table_id_to_rootpage: SkipMap<MVTableId, Option<u64>>,
     // unique timestamp
     clock: Clock,
@@ -209,11 +525,14 @@ pub struct MvStore<Clock: LogicalClock> {
     // 한번에 하나의 트랜잭션만 커밋을 할 수 있도록 한다.
     // 예: begin_exclusive_tx 시작시 write lock을 획득하여 다른 트랜잭션이 커밋을 시작하지 못하도록 한다.
     commit_coordinator: Arc<CommitCoordinator>,
+    table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn new(clock: Clock, storage: Storage) -> Self {
         Self {
+            rows: SkipMap::new(),
+            index_rows: SkipMap::new(),
             table_id_to_rootpage: SkipMap::from_iter(vec![(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1))]),
             clock,
             storage,
@@ -227,6 +546,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             commit_coordinator: Arc::new(CommitCoordinator {
                 pager_commit_lock: Arc::new(GrainRwLock::new()),
             }),
+            table_id_to_last_rowid: RwLock::new(HashMap::new()),
         }
     }
 
@@ -449,6 +769,203 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    /// Same as insert() but can insert to a table or an index, indicated by the `maybe_index_id` argument.
+    pub fn insert_to_table_or_index(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+    ) -> Result<()> {
+        tracing::trace!("insert(tx_id={}, row.id={:?})", tx_id, row.id);
+
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or(GrainError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = tx.value();
+        assert_eq!(tx.state, TransactionState::Active);
+        let id = row.id.clone();
+        match maybe_index_id {
+            Some(index_id) => {
+                let row_version = RowVersion {
+                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
+                    end: None,
+                    row: row.clone(),
+                    btree_resident: false,
+                };
+                let RowKey::Record(sortable_key) = row.id.row_id else {
+                    panic!("Index writes must be to a record");
+                };
+                tx.insert_to_write_set(id.clone());
+                self.insert_index_version(index_id, sortable_key, row_version);
+            }
+            None => {
+                let row_version = RowVersion {
+                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
+                    end: None,
+                    row,
+                    btree_resident: false,
+                };
+                tx.insert_to_write_set(id.clone());
+                let allocator = self.get_rowid_allocator(&id.table_id);
+                allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
+                self.insert_version(id, row_version);
+            }
+        }
+        Ok(())
+    }
+
+    /// Inserts a new row version into the database, while making sure that
+    /// the row version is inserted in the correct order.
+    /// MvStore의 rows에 저장. 벡터로 관리
+    fn insert_version(&self, id: RowID, row_version: RowVersion) {
+        let versions = self.rows.get_or_insert_with(id, || RwLock::new(Vec::new()));
+        let mut versions = versions.value().write();
+        self.insert_version_raw(&mut versions, row_version)
+    }
+
+    /// MvStore의 index_rows에 저장. 벡터로 관리
+    pub fn insert_index_version(
+        &self,
+        index_id: MVTableId,
+        key: SortableIndexKey,
+        row_version: RowVersion,
+    ) {
+        let index = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
+        let index = index.value();
+        let versions = index.get_or_insert_with(key, || RwLock::new(Vec::new()));
+        let mut versions = versions.value().write();
+        self.insert_version_raw(&mut versions, row_version);
+    }
+
+    /// Inserts a new row version into the internal data structure for versions,
+    /// while making sure that the row version is inserted in the correct order.
+    /// 시간 순서에 가깝게 들어올 것으로 예상하므로 트리를 사용하지 않고 선형 탐색 및 삽입을 사용
+    pub fn insert_version_raw(&self, versions: &mut Vec<RowVersion>, row_version: RowVersion) {
+        // NOTICE: this is an insert a'la insertion sort, with pessimistic linear complexity.
+        // However, we expect the number of versions to be nearly sorted, so we deem it worthy
+        // to search linearly for the insertion point instead of paying the price of using
+        // another data structure, e.g. a BTreeSet. If it proves to be too quadratic empirically,
+        // we can either switch to a tree-like structure, or at least use partition_point()
+        // which performs a binary search for the insertion point.
+        let mut position = 0_usize;
+        // 보통 시간 순서로 들어오므로 뒤에서부터 찾기 시작
+        for (i, v) in versions.iter().enumerate().rev() {
+            let existing_begin = self.get_begin_timestamp(&v.begin);
+            let new_begin = self.get_begin_timestamp(&row_version.begin);
+            if existing_begin <= new_begin {
+                if existing_begin == new_begin
+                    && existing_begin == LOGICAL_LOG_RECOVERY_COMMIT_TIMESTAMP
+                {
+                    // During recovery we may have both an insert for row R and a deletion for row R.
+                    // In these cases just replace the version so that "find_last_visible_version()" doesn't return
+                    // the non-deleted version since both of the versions have the same begin timestamp during recovery.
+                    versions[position] = row_version;
+                    return;
+                } else {
+                    position = i + 1;
+                }
+                break;
+            }
+        }
+        // 찾은 삽입될 위치에 insert
+        versions.insert(position, row_version);
+    }
+
+    // Extracts the begin timestamp from a transaction
+    #[inline]
+    fn get_begin_timestamp(&self, ts_or_id: &Option<TxTimestampOrID>) -> u64 {
+        match ts_or_id {
+            Some(TxTimestampOrID::Timestamp(ts)) => *ts,
+            Some(TxTimestampOrID::TxID(tx_id)) => {
+                self.txs
+                    .get(tx_id)
+                    .expect("transaction should exist in txs map")
+                    .value()
+                    .begin_ts
+            }
+            // This function is intended to be used in the ordering of row versions within the row version chain in `insert_version_raw`.
+            //
+            // The row version chain should be append-only (aside from garbage collection),
+            // so the specific ordering handled by this function may not be critical. We might
+            // be able to append directly to the row version chain in the future.
+            //
+            // The value 0 is used here to represent an infinite timestamp value. This is a deliberate
+            // choice for a planned future bitpacking optimization, reserving 0 for this purpose,
+            // while actual timestamps will start from 1.
+            None => 0,
+        }
+    }
+
+    /// Same as read() but can read from a table or an index, indicated by the `maybe_index_id` argument.
+    /// 특정 행(`id`)에 대한 최신 버전의 데이터를 읽기
+    pub fn read_from_table_or_index(
+        &self,
+        tx_id: TxID,
+        id: RowID,
+        maybe_index_id: Option<MVTableId>,
+    ) -> Result<Option<Row>> {
+        tracing::trace!("read(tx_id={}, id={:?})", tx_id, id);
+
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or(GrainError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = tx.value();
+        assert_eq!(tx.state, TransactionState::Active);
+        match maybe_index_id {
+            Some(index_id) => {
+                let rows = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
+                let rows = rows.value();
+                let RowKey::Record(sortable_key) = id.row_id else {
+                    panic!("Index reads must have a record row_id");
+                };
+                let row_versions_opt = rows.get(&sortable_key);
+                if let Some(ref row_versions) = row_versions_opt {
+                    let row_versions = row_versions.value().read();
+                    if let Some(rv) = row_versions
+                        .iter()
+                        .rev()
+                        .find(|rv| rv.is_visible_to(tx, &self.txs))
+                    {
+                        return Ok(Some(rv.row.clone()));
+                    }
+                }
+                Ok(None)
+            }
+            None => {
+                if let Some(row_versions) = self.rows.get(&id) {
+                    let row_versions = row_versions.value().read();
+                    // visible한 가장 최신을 찾아야 하므로 뒤에서 부터 탐색
+                    if let Some(rv) = row_versions
+                        .iter()
+                        .rev()
+                        .find(|rv| rv.is_visible_to(tx, &self.txs))
+                    {
+                        tx.insert_to_read_set(id);
+                        return Ok(Some(rv.row.clone()));
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Same as update() but can update a table or an index, indicated by the `maybe_index_id` argument.    
+    pub fn update_to_table_or_index(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+    ) -> Result<bool> {
+        tracing::trace!("update(tx_id={}, row.id={:?})", tx_id, row.id);
+        if !self.delete_from_table_or_index(tx_id, row.id.clone(), maybe_index_id)? {
+            return Ok(false);
+        }
+        self.insert_to_table_or_index(tx_id, row, maybe_index_id)?;
+        Ok(true)
+    }
+
     pub fn maybe_recover_logical_log(&self, connection: Arc<Connection>) -> Result<bool> {
         Ok(true)
     }
@@ -465,5 +982,20 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Gets current timestamp
     pub fn get_timestamp(&self) -> u64 {
         self.clock.get_timestamp()
+    }
+
+    pub fn get_rowid_allocator(&self, table_id: &MVTableId) -> Arc<RowidAllocator> {
+        let mut map = self.table_id_to_last_rowid.write();
+        if map.contains_key(table_id) {
+            map.get(table_id).unwrap().clone()
+        } else {
+            let allocator = Arc::new(RowidAllocator {
+                lock: GrainRwLock::new(),
+                max_rowid: RwLock::new(None),
+                initialized: AtomicBool::new(false),
+            });
+            map.insert(*table_id, allocator.clone());
+            allocator
+        }
     }
 }

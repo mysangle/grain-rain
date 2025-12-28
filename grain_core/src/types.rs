@@ -303,12 +303,28 @@ pub struct ImmutableRecord {
 
 impl ImmutableRecord {
     pub fn get_values<'a>(&'a self) -> Vec<ValueRef<'a>> {
-        // let mut cursor = RecordCursor::new();
-        // cursor
-        //     .get_values(self)
-        //     .collect::<Result<Vec<_>>>()
-        //     .unwrap_or_default()
-        vec![]
+        let mut cursor = RecordCursor::new();
+        cursor
+            .get_values(self)
+            .collect::<Result<Vec<_>>>()
+            .unwrap_or_default()
+    }
+
+    pub fn get_payload(&self) -> &[u8] {
+        self.as_blob()
+    }
+
+    pub fn as_blob(&self) -> &Vec<u8> {
+        match &self.payload {
+            Value::Blob(b) => b,
+            _ => panic!("payload must be a blob"),
+        }
+    }
+
+    pub fn column_count(&self) -> usize {
+        let mut cursor = RecordCursor::new();
+        cursor.parse_full_header(self).unwrap();
+        cursor.serial_types.len()
     }
 }
 
@@ -390,5 +406,15 @@ impl Cursor {
             //_ => panic!("Cursor is not a btree"),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Metadata about an index, used for handling and comparing index keys.
+///
+/// This struct provides information about the sorting order of columns,
+/// whether the index includes a row ID, and the total number of columns
+/// in the index.
+pub struct IndexInfo {
+
 }
 
