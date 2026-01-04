@@ -9,6 +9,7 @@ members = [
 
 [workspace.dependencies]
 anyhow = "1.0.98"
+either = { version = "1.15" }
 grain_core = { path = "grain_core", version = "0.1.0" }
 grain_macros = { path = "macros", version = "0.1.0" }
 grain_parser = { path = "parser", version = "0.1.0" }

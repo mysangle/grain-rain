@@ -1,13 +1,22 @@
 
 use crate::{
+    error::GrainError,
     io::Completion,
-    storage::btree::CursorTrait,
+    storage::{
+        btree::CursorTrait,
+        sqlite3_ondisk::read_varint,
+    },
+    translate::collate::CollationSeq,
     IO, Result,
 };
+use either::Either;
+use grain_parser::ast::SortOrder;
 use serde::Deserialize;
 use std::{
     borrow::{Borrow, Cow},
+    cell::UnsafeCell,
     fmt::Display,
+    iter::Peekable,
     ops::Deref,
 };
 
@@ -173,13 +182,6 @@ impl PartialOrd<Value> for Value {
     }
 }
 
-impl AsValueRef for Value {
-    #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
-        self.as_ref()
-    }
-}
-
 impl Value {
     pub fn as_ref<'a>(&'a self) -> ValueRef<'a> {
         match self {
@@ -292,18 +294,109 @@ pub trait AsValueRef {
     fn as_value_ref<'a>(&'a self) -> ValueRef<'a>;
 }
 
+impl<'b> AsValueRef for ValueRef<'b> {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        *self
+    }
+}
+
+impl AsValueRef for Value {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        self.as_ref()
+    }
+}
+
+impl AsValueRef for &mut Value {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        self.as_ref()
+    }
+}
+
+impl<V1, V2> AsValueRef for Either<V1, V2>
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+{
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        match self {
+            Either::Left(left) => left.as_value_ref(),
+            Either::Right(right) => right.as_value_ref(),
+        }
+    }
+}
+
+impl<V: AsValueRef> AsValueRef for &V {
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        (*self).as_value_ref()
+    }
+}
+
 /// 단일 레코드(행)를 직렬화된 바이너리 형식으로 저장
 /// [헤더크기][데이터 타입 정보1][데이터 타입 정보2]...[실제 데이터1][실제 데이터2]...
 /// 
 /// SQL에서 정렬과 같은 작업을 처리하기 위해 Ord와 PartialOrd는 필수적이며, 그 외 다른 trait들도 중요한 역할을 한다.
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+/// 
+/// 특징: 일단 원시 데이터(바이트 덩어리)로 가지고 있되, 꼭 필요할 때, 필요한 만큼만, 복사 없이 보여준다
 pub struct ImmutableRecord {
+    // 원시 바이트 데이터
     payload: Value,
+    // payload를 지연 파싱
+    cursor: UnsafeCell<RecordCursor>,
+}
+
+unsafe impl Send for ImmutableRecord {}
+unsafe impl Sync for ImmutableRecord {}
+
+impl Clone for ImmutableRecord {
+    fn clone(&self) -> Self {
+        Self {
+            payload: self.payload.clone(),
+            cursor: UnsafeCell::new(RecordCursor::new()), // Reset cursor state on clone
+        }
+    }
+}
+
+impl PartialEq for ImmutableRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.payload == other.payload // Only compare payload, ignore cursor state
+    }
+}
+
+impl Eq for ImmutableRecord {}
+
+impl PartialOrd for ImmutableRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ImmutableRecord {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.payload.cmp(&other.payload) // Only compare payload, ignore cursor state
+    }
 }
 
 impl ImmutableRecord {
-    pub fn get_values<'a>(&'a self) -> Vec<ValueRef<'a>> {
-        let mut cursor = RecordCursor::new();
+    pub fn new(payload_capacity: usize) -> Self {
+        Self {
+            payload: Value::Blob(Vec::with_capacity(payload_capacity)),
+            cursor: UnsafeCell::new(RecordCursor::new()),
+        }
+    }
+
+    pub fn from_bin_record(payload: Vec<u8>) -> Self {
+        Self {
+            payload: Value::Blob(payload),
+            cursor: UnsafeCell::new(RecordCursor::new()),
+        }
+    }
+
+    pub fn get_values(&self) -> Vec<ValueRef<'_>> {
+        let cursor = self.cursor();
         cursor
             .get_values(self)
             .collect::<Result<Vec<_>>>()
@@ -321,10 +414,52 @@ impl ImmutableRecord {
         }
     }
 
+    #[inline]
+    pub fn cursor(&self) -> &mut RecordCursor {
+        // SAFETY: See the unsafe impl Send/Sync for ImmutableRecord
+        unsafe { &mut *self.cursor.get() }
+    }
+
     pub fn column_count(&self) -> usize {
-        let mut cursor = RecordCursor::new();
+        let cursor = self.cursor();
         cursor.parse_full_header(self).unwrap();
         cursor.serial_types.len()
+    }
+
+    #[inline]
+    pub fn invalidate(&mut self) {
+        self.as_blob_mut().clear();
+        self.cursor().invalidate();
+    }
+
+    #[inline]
+    pub fn is_invalidated(&self) -> bool {
+        self.as_blob().is_empty()
+    }
+
+    #[inline]
+    pub fn start_serialization(&mut self, payload: &[u8]) {
+        self.as_blob_mut().extend_from_slice(payload);
+    }
+
+    #[inline]
+    pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
+        match &mut self.payload {
+            Value::Blob(b) => b,
+            _ => panic!("payload must be a blob"),
+        }
+    }
+
+    pub fn last_value(&self) -> Option<Result<ValueRef<'_>>> {
+        if self.is_invalidated() {
+            return Some(Err(GrainError::InternalError(
+                "Record is invalidated".into(),
+            )));
+        }
+        let cursor = self.cursor();
+        cursor.parse_full_header(self).unwrap();
+        let last_idx = cursor.serial_types.len().checked_sub(1)?;
+        Some(cursor.deserialize_column(self, last_idx))
     }
 }
 
@@ -356,14 +491,157 @@ impl std::fmt::Debug for ImmutableRecord {
 /// `[header_size][serial_type1][serial_type2]...[data1][data2]...`
 #[derive(Debug, Default)]
 pub struct RecordCursor {
-
+    /// Parsed serial type values for each column.
+    /// Serial types encode both the data type and size information.
+    pub serial_types: Vec<u64>,
+    /// Byte offsets where each column's data begins in the record payload.
+    /// Always has one more entry than `serial_types` (the final offset marks the end).
+    pub offsets: Vec<usize>,
+    /// Total size of the record header in bytes.
+    pub header_size: usize,
+    /// Current parsing position within the header section.
+    pub header_offset: usize,
 }
 
 impl RecordCursor {
     pub fn new() -> Self {
         Self {
-
+            serial_types: Vec::new(),
+            offsets: Vec::new(),
+            header_size: 0,
+            header_offset: 0,
         }
+    }
+
+    pub fn invalidate(&mut self) {
+        self.serial_types.clear();
+        self.offsets.clear();
+        self.header_size = 0;
+        self.header_offset = 0;
+    }
+
+    pub fn is_invalidated(&self) -> bool {
+        self.serial_types.is_empty() && self.offsets.is_empty()
+    }
+
+    pub fn parse_full_header(&mut self, record: &ImmutableRecord) -> Result<()> {
+        self.ensure_parsed_upto(record, MAX_COLUMN)
+    }
+
+    /// 레코드의 전체 데이터를 한 번에 파싱하는 대신, 필요한 열(column)까지만 헤더 정보를 파싱
+    #[inline(always)]
+    pub fn ensure_parsed_upto(
+        &mut self,
+        record: &ImmutableRecord,
+        target_idx: usize,
+    ) -> Result<()> {
+        let payload = record.get_payload();
+        if payload.is_empty() {
+            return Ok(());
+        }
+
+        // Parse header size and initialize parsing
+        if self.serial_types.is_empty() && self.offsets.is_empty() {
+            let (header_size, bytes_read) = read_varint(payload)?;
+            self.header_size = header_size as usize;
+            self.header_offset = bytes_read;
+            self.offsets.push(self.header_size); // First column starts after header
+        }
+
+        // Parse serial types incrementally
+        while self.serial_types.len() <= target_idx
+            && self.header_offset < self.header_size
+            && self.header_offset < payload.len()
+        {
+            let (serial_type, read_bytes) = read_varint(&payload[self.header_offset..])?;
+            self.serial_types.push(serial_type);
+            self.header_offset += read_bytes;
+
+            let serial_type_obj = SerialType::try_from(serial_type)?;
+            let data_size = serial_type_obj.size();
+            let prev_offset = *self.offsets.last().unwrap();
+            self.offsets.push(prev_offset + data_size);
+        }
+
+        Ok(())
+    }
+
+    /// 바이너리 페이로드의 특정 부분(idx)을 실제 ValueRef 타입으로 해석
+    /// ensure_parsed_upto를 통해 미리 해석이 되어 있어야 한다.
+    pub fn deserialize_column<'a>(
+        &self,
+        record: &'a ImmutableRecord,
+        idx: usize,
+    ) -> Result<ValueRef<'a>> {
+        if idx >= self.serial_types.len() {
+            return Ok(ValueRef::Null);
+        }
+
+        let serial_type = self.serial_types[idx];
+        let serial_type_obj = SerialType::try_from(serial_type)?;
+
+        match serial_type_obj.kind() {
+            SerialTypeKind::Null => return Ok(ValueRef::Null),
+            SerialTypeKind::ConstInt0 => return Ok(ValueRef::Integer(0)),
+            SerialTypeKind::ConstInt1 => return Ok(ValueRef::Integer(1)),
+            _ => {} // continue
+        }
+
+        if idx + 1 >= self.offsets.len() {
+            return Ok(ValueRef::Null);
+        }
+
+        let start = self.offsets[idx];
+        let end = self.offsets[idx + 1];
+        let payload = record.get_payload();
+
+        let slice = &payload[start..end];
+        let (value, _) = crate::storage::sqlite3_ondisk::read_value(slice, serial_type_obj)?;
+        Ok(value)
+    }
+
+    pub fn get_values<'a, 'b>(
+        &'b mut self,
+        record: &'a ImmutableRecord,
+    ) -> Peekable<impl ExactSizeIterator<Item = Result<ValueRef<'a>>> + use<'a, 'b>> {
+        struct GetValues<'a, 'b> {
+            cursor: &'b mut RecordCursor,
+            record: &'a ImmutableRecord,
+            idx: usize,
+        }
+
+        impl<'a, 'b> Iterator for GetValues<'a, 'b> {
+            type Item = Result<ValueRef<'a>>;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                if self.idx == 0 {
+                    // So that we can have the full length of serial types
+                    if let Err(err) = self.cursor.parse_full_header(self.record) {
+                        return Some(Err(err));
+                    }
+                }
+                if !self.record.is_invalidated() && self.idx < self.cursor.serial_types.len() {
+                    let res = self.cursor.deserialize_column(self.record, self.idx);
+                    self.idx += 1;
+                    Some(res)
+                } else {
+                    None
+                }
+            }
+        }
+
+        impl<'a, 'b> ExactSizeIterator for GetValues<'a, 'b> {
+            fn len(&self) -> usize {
+                self.cursor.serial_types.len() - self.idx
+            }
+        }
+
+        let get_values = GetValues {
+            cursor: self,
+            record,
+            idx: 0,
+        };
+        get_values.peekable()
     }
 }
 
@@ -408,6 +686,12 @@ impl Cursor {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyInfo {
+    pub sort_order: SortOrder,
+    pub collation: CollationSeq,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Metadata about an index, used for handling and comparing index keys.
 ///
@@ -415,6 +699,188 @@ impl Cursor {
 /// whether the index includes a row ID, and the total number of columns
 /// in the index.
 pub struct IndexInfo {
-
+    // Specifies the sorting order (ascending or descending) for each column in the index.
+    pub key_info: Vec<KeyInfo>,
+    /// Indicates whether the index includes a row ID column.
+    pub has_rowid: bool,
+    /// The total number of columns in the index, including the row ID column if present.
+    pub num_cols: usize,
 }
 
+const I8_LOW: i64 = -128;
+const I8_HIGH: i64 = 127;
+const I16_LOW: i64 = -32768;
+const I16_HIGH: i64 = 32767;
+const I24_LOW: i64 = -8388608;
+const I24_HIGH: i64 = 8388607;
+const I32_LOW: i64 = -2147483648;
+const I32_HIGH: i64 = 2147483647;
+const I48_LOW: i64 = -140737488355328;
+const I48_HIGH: i64 = 140737488355327;
+
+/// Sqlite Serial Types
+/// https://www.sqlite.org/fileformat.html#record_format
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct SerialType(u64);
+
+impl TryFrom<u64> for SerialType {
+    type Error = GrainError;
+
+    fn try_from(uint: u64) -> Result<Self> {
+        if uint == 10 || uint == 11 {
+            return Err(GrainError::Corrupt(format!("Invalid serial type: {uint}")));
+        }
+        Ok(SerialType(uint))
+    }
+}
+
+impl SerialType {
+    pub fn kind(&self) -> SerialTypeKind {
+        match self.0 {
+            0 => SerialTypeKind::Null,
+            1 => SerialTypeKind::I8,
+            2 => SerialTypeKind::I16,
+            3 => SerialTypeKind::I24,
+            4 => SerialTypeKind::I32,
+            5 => SerialTypeKind::I48,
+            6 => SerialTypeKind::I64,
+            7 => SerialTypeKind::F64,
+            8 => SerialTypeKind::ConstInt0,
+            9 => SerialTypeKind::ConstInt1,
+            n if n >= 12 => match n % 2 {
+                0 => SerialTypeKind::Blob,
+                1 => SerialTypeKind::Text,
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        match self.kind() {
+            SerialTypeKind::Null => 0,
+            SerialTypeKind::I8 => 1,
+            SerialTypeKind::I16 => 2,
+            SerialTypeKind::I24 => 3,
+            SerialTypeKind::I32 => 4,
+            SerialTypeKind::I48 => 6,
+            SerialTypeKind::I64 => 8,
+            SerialTypeKind::F64 => 8,
+            SerialTypeKind::ConstInt0 => 0,
+            SerialTypeKind::ConstInt1 => 0,
+            SerialTypeKind::Text => (self.0 as usize - 13) / 2,
+            SerialTypeKind::Blob => (self.0 as usize - 12) / 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SerialTypeKind {
+    Null,
+    I8,
+    I16,
+    I24,
+    I32,
+    I48,
+    I64,
+    F64,
+    ConstInt0,
+    ConstInt1,
+    Text,
+    Blob,
+}
+
+pub fn compare_immutable<V1, V2, E1, E2, I1, I2>(
+    l: I1,
+    r: I2,
+    column_info: &[KeyInfo],
+) -> std::cmp::Ordering
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+    E1: ExactSizeIterator<Item = V1>,
+    E2: ExactSizeIterator<Item = V2>,
+    I1: IntoIterator<IntoIter = E1, Item = E1::Item>,
+    I2: IntoIterator<IntoIter = E2, Item = E2::Item>,
+{
+    let (l, r): (E1, E2) = (l.into_iter(), r.into_iter());
+    assert!(
+        l.len() >= column_info.len(),
+        "{} < {}",
+        l.len(),
+        column_info.len()
+    );
+    assert!(
+        r.len() >= column_info.len(),
+        "{} < {}",
+        r.len(),
+        column_info.len()
+    );
+    let (l, r) = (l.take(column_info.len()), r.take(column_info.len()));
+    for (i, (l, r)) in l.zip(r).enumerate() {
+        let column_order = column_info[i].sort_order;
+        let collation = column_info[i].collation;
+        let cmp = compare_immutable_single(l, r, collation);
+        if !cmp.is_eq() {
+            return match column_order {
+                SortOrder::Asc => cmp,
+                SortOrder::Desc => cmp.reverse(),
+            };
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+pub fn compare_immutable_single<V1, V2>(l: V1, r: V2, collation: CollationSeq) -> std::cmp::Ordering
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+{
+    let l = l.as_value_ref();
+    let r = r.as_value_ref();
+    match (l, r) {
+        (ValueRef::Text(left), ValueRef::Text(right)) => collation.compare_strings(&left, &right),
+        _ => l.partial_cmp(&r).unwrap(),
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum SeekResult {
+    /// Record matching the [SeekOp] found in the B-tree and cursor was positioned to point onto that record
+    Found,
+    /// Record matching the [SeekOp] doesn't exists in the B-tree
+    NotFound,
+    /// This result can happen only if eq_only for [SeekOp] is false
+    /// In this case Seek can position cursor to the leaf page boundaries (before the start, after the end)
+    /// (e.g. if leaf page holds rows with keys from range [1..10], key 10 is absent and [SeekOp] is >= 10)
+    ///
+    /// turso-db has this extra [SeekResult] in order to make [BTreeCursor::seek] method to position cursor at
+    /// the leaf of potential insertion, but also communicate to caller the fact that current cursor position
+    /// doesn't hold a matching entry
+    /// (necessary for Seek{XX} VM op-codes, so these op-codes will try to advance cursor in order to move it to matching entry)
+    TryAdvance,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// The match condition of a table/index seek.
+pub enum SeekOp {
+    /// If eq_only is true, this means in practice:
+    /// We are iterating forwards, but we are really looking for an exact match on the seek key.
+    GE {
+        eq_only: bool,
+    },
+    GT,
+    /// If eq_only is true, this means in practice:
+    /// We are iterating backwards, but we are really looking for an exact match on the seek key.
+    LE {
+        eq_only: bool,
+    },
+    LT,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum SeekKey<'a> {
+    TableRowId(i64),
+    IndexKey(&'a ImmutableRecord),
+}

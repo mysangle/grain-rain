@@ -28,6 +28,10 @@ pub enum GrainError {
         "Database is empty, header does not exist - page 1 should've been allocated before this"
     )]
     Page1NotAlloc,
+    #[error("Parse error: {0}")]
+    ParseError(String),
+    #[error("Write-write conflict")]
+    WriteWriteConflict,
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
@@ -40,6 +44,13 @@ pub enum CompletionError {
     },
     #[error("I/O error: {0}")]
     IOError(std::io::ErrorKind),
+}
+
+#[macro_export]
+macro_rules! bail_parse_error {
+    ($($arg:tt)*) => {
+        return Err($crate::error::GrainError::ParseError(format!($($arg)*)))
+    };
 }
 
 #[macro_export]

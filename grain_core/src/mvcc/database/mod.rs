@@ -9,7 +9,7 @@ use crate::{
         sqlite3_ondisk::DatabaseHeader,
         wal::GrainRwLock,
     },
-    types::{ImmutableRecord, IndexInfo},
+    types::{compare_immutable, ImmutableRecord, IndexInfo, RecordCursor},
     Connection, GrainError, IOExt, Result, Pager,
 };
 use crossbeam_skiplist::{SkipMap, SkipSet};
@@ -56,13 +56,51 @@ impl From<MVTableId> for i64 {
 /// Wrapper for index keys that implements collation-aware, ASC/DESC-aware ordering.
 #[derive(Debug, Clone)]
 pub struct SortableIndexKey {
+    // 실제 키 데이터
     pub key: ImmutableRecord,
+    // 비교 방법에 대한 규칙
     pub metadata: Arc<IndexInfo>,
 }
 
 impl SortableIndexKey {
+    pub fn new_from_bytes(key_bytes: Vec<u8>, metadata: Arc<IndexInfo>) -> Self {
+        Self {
+            key: ImmutableRecord::from_bin_record(key_bytes),
+            metadata,
+        }
+    }
+
     pub fn new_from_record(key: ImmutableRecord, metadata: Arc<IndexInfo>) -> Self {
         Self { key, metadata }
+    }
+
+    fn compare(&self, other: &Self) -> Result<std::cmp::Ordering> {
+        let mut lhs_cursor = RecordCursor::new();
+        let mut rhs_cursor = RecordCursor::new();
+
+        // We sometimes need to compare a shorter key to a longer one,
+        // for example when seeking with an index key that is a prefix of the full key.
+        let num_cols = self.metadata.num_cols.min(other.metadata.num_cols);
+
+        lhs_cursor.ensure_parsed_upto(&self.key, num_cols - 1)?;
+        rhs_cursor.ensure_parsed_upto(&other.key, num_cols - 1)?;
+
+        for i in 0..num_cols {
+            let lhs_value = lhs_cursor.deserialize_column(&self.key, i)?;
+            let rhs_value = rhs_cursor.deserialize_column(&other.key, i)?;
+
+            let cmp = compare_immutable(
+                std::iter::once(&lhs_value),
+                std::iter::once(&rhs_value),
+                &self.metadata.key_info[i..i + 1],
+            );
+
+            if cmp != std::cmp::Ordering::Equal {
+                return Ok(cmp);
+            }
+        }
+
+        Ok(std::cmp::Ordering::Equal)
     }
 }
 
@@ -168,13 +206,28 @@ impl Row {
             column_count,
         }
     }
+
+    pub fn payload(&self) -> &[u8] {
+        match self.id.row_id {
+            RowKey::Int(_) => self.data.as_ref().expect("table rows should have data"),
+            RowKey::Record(ref sortable_key) => sortable_key.key.as_blob(),
+        }
+    }
 }
 
 /// A row version.
 /// TODO: we can optimize this by using bitpacking for the begin and end fields.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowVersion {
+    // 버전의 유효기간이 시작되는 시점
+    // None              : 발생하지 않아야 하는 경우지만 가시성이 있다고 보고 true를 반환
+    // Timestamp(ts)     : 커밋된 트랜잭션에 의해 생성
+    // TxID(begin_tx_id) : 아직 커밋되지 않은 트랜잭션에 의해 생성
     pub begin: Option<TxTimestampOrID>,
+    // 버전의 유효기간이 끝나는 시점
+    // None              : 아직 삭제되지 않음
+    // Timestamp(ts)     : 커밋된 트랜잭션에 의해 삭제됨
+    // TxID(end_tx_id)   : 아직 커밋되지 않은 트랜잭션에 의해 삭제됨
     pub end: Option<TxTimestampOrID>,
     pub row: Row,
     /// Indicates this version was created for a row that existed in B-tree before
@@ -807,8 +860,57 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     btree_resident: false,
                 };
                 tx.insert_to_write_set(id.clone());
+                // 사용자가 수동으로 row id를 넣었을 수도 있으므로 확인
+                // 예를 들어 현재 최신 row id가 100인 상태에서 사용자가 임의로 500으로 넣었다면 다음 row id는 501이 되어야 한다.
                 let allocator = self.get_rowid_allocator(&id.table_id);
                 allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
+                self.insert_version(id, row_version);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn insert_btree_resident_to_table_or_index(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+    ) -> Result<()> {
+        tracing::trace!(
+            "insert_btree_resident(tx_id={}, row.id={:?})",
+            tx_id,
+            row.id
+        );
+
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| GrainError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = tx.value();
+        assert_eq!(tx.state, TransactionState::Active);
+        let id = row.id.clone();
+        match maybe_index_id {
+            Some(index_id) => {
+                let row_version = RowVersion {
+                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
+                    end: None,
+                    row: row.clone(),
+                    btree_resident: true,
+                };
+                let RowKey::Record(sortable_key) = row.id.row_id else {
+                    panic!("Index writes must be to a record");
+                };
+                tx.insert_to_write_set(id.clone());
+                self.insert_index_version(index_id, sortable_key, row_version);
+            }
+            None => {
+                let row_version = RowVersion {
+                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
+                    end: None,
+                    row,
+                    btree_resident: true,
+                };
+                tx.insert_to_write_set(id.clone());
                 self.insert_version(id, row_version);
             }
         }
@@ -966,6 +1068,96 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(true)
     }
 
+    /// Same as delete() but can delete from a table or an index, indicated by the `maybe_index_id` argument.
+    pub fn delete_from_table_or_index(
+        &self,
+        tx_id: TxID,
+        id: RowID,
+        maybe_index_id: Option<MVTableId>,
+    ) -> Result<bool> {
+        tracing::trace!("delete(tx_id={}, id={:?})", tx_id, id);
+
+        match maybe_index_id {
+            Some(index_id) => {
+                let rows = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
+                let rows = rows.value();
+                let RowKey::Record(sortable_key) = id.row_id.clone() else {
+                    panic!("Index deletes must have a record row_id");
+                };
+                let row_versions_opt = rows.get(&sortable_key);
+                if let Some(ref row_versions) = row_versions_opt {
+                    let mut row_versions = row_versions.value().write();
+                    for rv in row_versions.iter_mut().rev() {
+                        let tx = self
+                            .txs
+                            .get(&tx_id)
+                            .ok_or_else(|| GrainError::NoSuchTransactionID(tx_id.to_string()))?;
+                        let tx = tx.value();
+                        assert_eq!(tx.state, TransactionState::Active);
+                        // A transaction cannot delete a version that it cannot see,
+                        // nor can it conflict with it.
+                        if !rv.is_visible_to(tx, &self.txs) {
+                            continue;
+                        }
+                        if is_write_write_conflict(&self.txs, tx, rv) {
+                            drop(row_versions);
+                            drop(row_versions_opt);
+                            return Err(GrainError::WriteWriteConflict);
+                        }
+
+                        rv.end = Some(TxTimestampOrID::TxID(tx.tx_id));
+                        let tx = self
+                            .txs
+                            .get(&tx_id)
+                            .ok_or_else(|| GrainError::NoSuchTransactionID(tx_id.to_string()))?;
+                        let tx = tx.value();
+                        tx.insert_to_write_set(id.clone());
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            None => {
+                let row_versions_opt = self.rows.get(&id);
+                if let Some(ref row_versions) = row_versions_opt {
+                    let mut row_versions = row_versions.value().write();
+                    for rv in row_versions.iter_mut().rev() {
+                        let tx = self
+                            .txs
+                            .get(&tx_id)
+                            .ok_or_else(|| GrainError::NoSuchTransactionID(tx_id.to_string()))?;
+                        let tx = tx.value();
+                        assert_eq!(tx.state, TransactionState::Active);
+                        // A transaction cannot delete a version that it cannot see,
+                        // nor can it conflict with it.
+                        if !rv.is_visible_to(tx, &self.txs) {
+                            continue;
+                        }
+                        if is_write_write_conflict(&self.txs, tx, rv) {
+                            // 쓰기-쓰기 충돌인 경우
+                            drop(row_versions);
+                            drop(row_versions_opt);
+                            return Err(GrainError::WriteWriteConflict);
+                        }
+
+                        // 물리적으로 데이터를 삭제하는 것이 아니라, "이 버전은 이 트랜잭션이 커밋되는 시점까지만 유효하다"고 표시
+                        rv.end = Some(TxTimestampOrID::TxID(tx.tx_id));
+                        drop(row_versions);
+                        drop(row_versions_opt);
+                        let tx = self
+                            .txs
+                            .get(&tx_id)
+                            .ok_or_else(|| GrainError::NoSuchTransactionID(tx_id.to_string()))?;
+                        let tx = tx.value();
+                        tx.insert_to_write_set(id);
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+        }
+    }
+
     pub fn maybe_recover_logical_log(&self, connection: Arc<Connection>) -> Result<bool> {
         Ok(true)
     }
@@ -997,5 +1189,33 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             map.insert(*table_id, allocator.clone());
             allocator
         }
+    }
+}
+
+/// 쓰기-쓰기 충돌
+///   다른 트랜잭션에서 업데이트중인 경우 또는 aborted된 트랜잭션인 경우
+///   내 트랜잭션이 시작한 이후에 다른 트랜잭션에서 이미 업데이트를 마친(commit) 경우
+pub(crate) fn is_write_write_conflict(
+    txs: &SkipMap<TxID, Transaction>,
+    tx: &Transaction,
+    rv: &RowVersion,
+) -> bool {
+    match rv.end {
+        Some(TxTimestampOrID::TxID(rv_end)) => {
+            let te = txs
+                .get(&rv_end)
+                .expect("transaction should exist in txs map");
+            let te = te.value();
+            if te.tx_id == tx.tx_id {
+                return false;
+            }
+            te.state.load() != TransactionState::Aborted
+        }
+        // A non-"infinity" end timestamp (here modeled by Some(ts)) functions as a write lock
+        // on the row, so it can never be updated by another transaction.
+        // Ref: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf , page 301,
+        // 2.6. Updating a Version.
+        Some(TxTimestampOrID::Timestamp(_)) => true,
+        None => false,
     }
 }

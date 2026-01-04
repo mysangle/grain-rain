@@ -1,21 +1,35 @@
 
 use bytemuck::{Pod, Zeroable};
 use crate::{
+    bail_corrupt_error,
+    error::GrainError,
     io::{Buffer, Completion, ReadComplete},
     storage::{
-        btree::offset::{
-            BTREE_CELL_CONTENT_AREA, BTREE_CELL_COUNT, BTREE_FIRST_FREEBLOCK,
-            BTREE_FRAGMENTED_BYTES_COUNT, BTREE_PAGE_TYPE, BTREE_RIGHTMOST_PTR,
+        btree::{
+            payload_overflow_threshold_max, payload_overflow_threshold_min,
+            offset::{
+                BTREE_CELL_CONTENT_AREA, BTREE_CELL_COUNT, BTREE_FIRST_FREEBLOCK,
+                BTREE_FRAGMENTED_BYTES_COUNT, BTREE_PAGE_TYPE, BTREE_RIGHTMOST_PTR,
+            },
         },
         buffer_pool::BufferPool,
         database::{DatabaseStorage, EncryptionOrChecksum},
         pager::Pager,
     },
+    types::{SerialType, SerialTypeKind, TextRef, TextSubtype, ValueRef},
     CompletionError, File, IOContext, Result,
 };
 use pack1::{I32BE, U16BE, U32BE};
 use std::sync::Arc;
 use super::pager::PageRef;
+
+/// The minimum size of a cell in bytes.
+pub const MINIMUM_CELL_SIZE: usize = 4;
+
+pub const CELL_PTR_SIZE_BYTES: usize = 2;
+pub const INTERIOR_PAGE_HEADER_SIZE_BYTES: usize = 12;
+pub const LEAF_PAGE_HEADER_SIZE_BYTES: usize = 8;
+pub const LEFT_CHILD_PTR_SIZE_BYTES: usize = 4;
 
 /// Copy로 인해 항상 복사가 일어난다.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Pod, Zeroable)]
@@ -209,6 +223,24 @@ impl PageContent {
         }
     }
 
+    pub fn page_type(&self) -> PageType {
+        self.read_u8(BTREE_PAGE_TYPE).try_into().unwrap()
+    }
+
+    /// Read a u8 from the page content at the given offset, taking account the possible db header on page 1 (self.offset).
+    /// Do not make this method public.
+    fn read_u8(&self, pos: usize) -> u8 {
+        let buf = self.as_ptr();
+        buf[self.offset + pos]
+    }
+
+    /// Read a u16 from the page content at the given offset, taking account the possible db header on page 1 (self.offset).
+    /// Do not make this method public.
+    fn read_u16(&self, pos: usize) -> u16 {
+        let buf = self.as_ptr();
+        u16::from_be_bytes([buf[self.offset + pos], buf[self.offset + pos + 1]])
+    }
+
     pub fn write_page_type(&self, value: u8) {
         self.write_u8(BTREE_PAGE_TYPE, value);
     }
@@ -260,6 +292,38 @@ impl PageContent {
     pub fn write_database_header(&self, header: &DatabaseHeader) {
         let buf = self.as_ptr();
         buf[0..DatabaseHeader::SIZE].copy_from_slice(bytemuck::bytes_of(header));
+    }
+
+    /// The number of cells on the page.
+    pub fn cell_count(&self) -> usize {
+        self.read_u16(BTREE_CELL_COUNT) as usize
+    }
+
+    pub fn cell_get(&self, idx: usize, usable_size: usize) -> Result<BTreeCell> {
+        tracing::trace!("cell_get(idx={})", idx);
+        let buf = self.as_ptr();
+
+        let ncells = self.cell_count();
+        assert!(
+            idx < ncells,
+            "cell_get: idx out of bounds: idx={idx}, ncells={ncells}"
+        );
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_pointer = self.read_u16(cell_pointer) as usize;
+
+        // SAFETY: this buffer is valid as long as the page is alive. We could store the page in the cell and do some lifetime magic
+        // but that is extra memory for no reason at all. Just be careful like in the old times :).
+        let static_buf: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) };
+        read_btree_cell(static_buf, self, cell_pointer, usable_size)
+    }
+
+    /// The size of the page header in bytes.
+    /// 8 bytes for leaf pages, 12 bytes for interior pages (due to storing rightmost child pointer)
+    pub fn header_size(&self) -> usize {
+        let is_interior = self.read_u8(BTREE_PAGE_TYPE) <= PageType::TableInterior as u8;
+        (!is_interior as usize) * LEAF_PAGE_HEADER_SIZE_BYTES
+            + (is_interior as usize) * INTERIOR_PAGE_HEADER_SIZE_BYTES
     }
 }
 
@@ -362,6 +426,20 @@ pub enum PageType {
     TableInterior = 5,
     IndexLeaf = 10,
     TableLeaf = 13,
+}
+
+impl TryFrom<u8> for PageType {
+    type Error = GrainError;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            2 => Ok(Self::IndexInterior),
+            5 => Ok(Self::TableInterior),
+            10 => Ok(Self::IndexLeaf),
+            13 => Ok(Self::TableLeaf),
+            _ => Err(GrainError::Corrupt(format!("Invalid page type: {value}"))),
+        }
+    }
 }
 
 /// 페이지의 내용을 파일에 쓰기
@@ -502,4 +580,318 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             io.pread(offset, c)
         }
     }
+}
+
+#[inline(always)]
+pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
+    let mut v: u64 = 0;
+    for i in 0..8 {
+        match buf.get(i) {
+            Some(c) => {
+                v = (v << 7) + (c & 0x7f) as u64;
+                if (c & 0x80) == 0 {
+                    return Ok((v, i + 1));
+                }
+            }
+            None => {
+                crate::bail_corrupt_error!("Invalid varint");
+            }
+        }
+    }
+    match buf.get(8) {
+        Some(&c) => {
+            // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
+            // Since the final value is `(v<<8) + c`, the top 8 bits (v >> 48) must not be 0.
+            // If those are zero, this should be treated as corrupt.
+            // Perf? the comparison + branching happens only in parsing 9-byte varint which is rare.
+            if (v >> 48) == 0 {
+                bail_corrupt_error!("Invalid varint");
+            }
+            v = (v << 8) + c as u64;
+            Ok((v, 9))
+        }
+        None => {
+            bail_corrupt_error!("Invalid varint");
+        }
+    }
+}
+
+/// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
+/// always.
+#[inline(always)]
+pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRef<'a>, usize)> {
+    match serial_type.kind() {
+        SerialTypeKind::Null => Ok((ValueRef::Null, 0)),
+        SerialTypeKind::I8 => {
+            if buf.is_empty() {
+                crate::bail_corrupt_error!("Invalid UInt8 value");
+            }
+            let val = buf[0] as i8;
+            Ok((ValueRef::Integer(val as i64), 1))
+        }
+        SerialTypeKind::I16 => {
+            if buf.len() < 2 {
+                crate::bail_corrupt_error!("Invalid BEInt16 value");
+            }
+            Ok((
+                ValueRef::Integer(i16::from_be_bytes([buf[0], buf[1]]) as i64),
+                2,
+            ))
+        }
+        SerialTypeKind::I24 => {
+            if buf.len() < 3 {
+                crate::bail_corrupt_error!("Invalid BEInt24 value");
+            }
+            let sign_extension = if buf[0] <= 127 { 0 } else { 255 };
+            Ok((
+                ValueRef::Integer(
+                    i32::from_be_bytes([sign_extension, buf[0], buf[1], buf[2]]) as i64
+                ),
+                3,
+            ))
+        }
+        SerialTypeKind::I32 => {
+            if buf.len() < 4 {
+                crate::bail_corrupt_error!("Invalid BEInt32 value");
+            }
+            Ok((
+                ValueRef::Integer(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64),
+                4,
+            ))
+        }
+        SerialTypeKind::I48 => {
+            if buf.len() < 6 {
+                crate::bail_corrupt_error!("Invalid BEInt48 value");
+            }
+            let sign_extension = if buf[0] <= 127 { 0 } else { 255 };
+            Ok((
+                ValueRef::Integer(i64::from_be_bytes([
+                    sign_extension,
+                    sign_extension,
+                    buf[0],
+                    buf[1],
+                    buf[2],
+                    buf[3],
+                    buf[4],
+                    buf[5],
+                ])),
+                6,
+            ))
+        }
+        SerialTypeKind::I64 => {
+            if buf.len() < 8 {
+                crate::bail_corrupt_error!("Invalid BEInt64 value");
+            }
+            Ok((
+                ValueRef::Integer(i64::from_be_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ])),
+                8,
+            ))
+        }
+        SerialTypeKind::F64 => {
+            if buf.len() < 8 {
+                crate::bail_corrupt_error!("Invalid BEFloat64 value");
+            }
+            Ok((
+                ValueRef::Float(f64::from_be_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ])),
+                8,
+            ))
+        }
+        SerialTypeKind::ConstInt0 => Ok((ValueRef::Integer(0), 0)),
+        SerialTypeKind::ConstInt1 => Ok((ValueRef::Integer(1), 0)),
+        SerialTypeKind::Blob => {
+            let content_size = serial_type.size();
+            if buf.len() < content_size {
+                crate::bail_corrupt_error!("Invalid Blob value");
+            }
+            Ok((ValueRef::Blob(&buf[..content_size]), content_size))
+        }
+        SerialTypeKind::Text => {
+            let content_size = serial_type.size();
+            if buf.len() < content_size {
+                crate::bail_corrupt_error!(
+                    "Invalid String value, length {} < expected length {}",
+                    buf.len(),
+                    content_size
+                );
+            }
+
+            // SAFETY: SerialTypeKind is Text so this buffer is a valid string
+            let val = unsafe { str::from_utf8_unchecked(&buf[..content_size]) };
+            Ok((
+                ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
+                content_size,
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum BTreeCell {
+    TableInteriorCell(TableInteriorCell),
+    TableLeafCell(TableLeafCell),
+    IndexInteriorCell(IndexInteriorCell),
+    IndexLeafCell(IndexLeafCell),
+}
+
+#[derive(Debug, Clone)]
+pub struct TableInteriorCell {
+    pub left_child_page: u32,
+    pub rowid: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TableLeafCell {
+    pub rowid: i64,
+    /// Payload of cell, if it overflows it won't include overflowed payload.
+    pub payload: &'static [u8],
+    /// This is the complete payload size including overflow pages.
+    pub payload_size: u64,
+    pub first_overflow_page: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexInteriorCell {
+    pub left_child_page: u32,
+    pub payload: &'static [u8],
+    /// This is the complete payload size including overflow pages.
+    pub payload_size: u64,
+    pub first_overflow_page: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexLeafCell {
+    pub payload: &'static [u8],
+    /// This is the complete payload size including overflow pages.
+    pub payload_size: u64,
+    pub first_overflow_page: Option<u32>,
+}
+
+/// read_btree_cell contructs a BTreeCell which is basically a wrapper around pointer to the payload of a cell.
+/// buffer input "page" is static because we want the cell to point to the data in the page in case it has any payload.
+pub fn read_btree_cell(
+    page: &'static [u8],
+    page_content: &PageContent,
+    pos: usize,
+    usable_size: usize,
+) -> Result<BTreeCell> {
+    let page_type = page_content.page_type();
+    let max_local = payload_overflow_threshold_max(page_type, usable_size);
+    let min_local = payload_overflow_threshold_min(page_type, usable_size);
+    match page_type {
+        PageType::IndexInterior => {
+            let mut pos = pos;
+            let left_child_page =
+                u32::from_be_bytes([page[pos], page[pos + 1], page[pos + 2], page[pos + 3]]);
+            pos += 4;
+            let (payload_size, nr) = read_varint(&page[pos..])?;
+            pos += nr;
+
+            let (overflows, to_read) =
+                payload_overflows(payload_size as usize, max_local, min_local, usable_size);
+            let to_read = if overflows { to_read } else { page.len() - pos };
+
+            let (payload, first_overflow_page) =
+                read_payload(&page[pos..pos + to_read], payload_size as usize);
+            Ok(BTreeCell::IndexInteriorCell(IndexInteriorCell {
+                left_child_page,
+                payload,
+                first_overflow_page,
+                payload_size,
+            }))
+        }
+        PageType::TableInterior => {
+            let mut pos = pos;
+            let left_child_page =
+                u32::from_be_bytes([page[pos], page[pos + 1], page[pos + 2], page[pos + 3]]);
+            pos += 4;
+            let (rowid, _) = read_varint(&page[pos..])?;
+            Ok(BTreeCell::TableInteriorCell(TableInteriorCell {
+                left_child_page,
+                rowid: rowid as i64,
+            }))
+        }
+        PageType::IndexLeaf => {
+            let mut pos = pos;
+            let (payload_size, nr) = read_varint(&page[pos..])?;
+            pos += nr;
+
+            let (overflows, to_read) =
+                payload_overflows(payload_size as usize, max_local, min_local, usable_size);
+            let to_read = if overflows { to_read } else { page.len() - pos };
+
+            let (payload, first_overflow_page) =
+                read_payload(&page[pos..pos + to_read], payload_size as usize);
+            Ok(BTreeCell::IndexLeafCell(IndexLeafCell {
+                payload,
+                first_overflow_page,
+                payload_size,
+            }))
+        }
+        PageType::TableLeaf => {
+            let mut pos = pos;
+            let (payload_size, nr) = read_varint(&page[pos..])?;
+            pos += nr;
+            let (rowid, nr) = read_varint(&page[pos..])?;
+            pos += nr;
+
+            let (overflows, to_read) =
+                payload_overflows(payload_size as usize, max_local, min_local, usable_size);
+            let to_read = if overflows { to_read } else { page.len() - pos };
+
+            let (payload, first_overflow_page) =
+                read_payload(&page[pos..pos + to_read], payload_size as usize);
+            Ok(BTreeCell::TableLeafCell(TableLeafCell {
+                rowid: rowid as i64,
+                payload,
+                first_overflow_page,
+                payload_size,
+            }))
+        }
+    }
+}
+
+// read_payload takes in the unread bytearray with the payload size
+/// and returns the payload on the page, and optionally the first overflow page number.
+fn read_payload(unread: &'static [u8], payload_size: usize) -> (&'static [u8], Option<u32>) {
+    let cell_len = unread.len();
+    // We will let overflow be constructed back if needed or requested.
+    if payload_size <= cell_len {
+        // fit within 1 page
+        (&unread[..payload_size], None)
+    } else {
+        // overflow
+        let first_overflow_page = u32::from_be_bytes([
+            unread[cell_len - 4],
+            unread[cell_len - 3],
+            unread[cell_len - 2],
+            unread[cell_len - 1],
+        ]);
+        (&unread[..cell_len - 4], Some(first_overflow_page))
+    }
+}
+
+/// Checks if payload will overflow a cell based on the maximum allowed size.
+/// It will return the min size that will be stored in that case,
+/// including overflow pointer
+/// see e.g. https://github.com/sqlite/sqlite/blob/9591d3fe93936533c8c3b0dc4d025ac999539e11/src/dbstat.c#L371
+pub fn payload_overflows(
+    payload_size: usize,
+    payload_overflow_threshold_max: usize,
+    payload_overflow_threshold_min: usize,
+    usable_size: usize,
+) -> (bool, usize) {
+    if payload_size <= payload_overflow_threshold_max {
+        return (false, 0);
+    }
+
+    let mut space_left = payload_overflow_threshold_min
+        + (payload_size - payload_overflow_threshold_min) % (usable_size - 4);
+    if space_left > payload_overflow_threshold_max {
+        space_left = payload_overflow_threshold_min;
+    }
+    (true, space_left + 4)
 }

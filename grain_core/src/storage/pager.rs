@@ -4,6 +4,7 @@ use crate::{
     io_yield_one, return_if_io,
     error::GrainError,
     storage::{
+        btree::offset::BTREE_PAGE_TYPE,
         buffer_pool::BufferPool,
         database::DatabaseStorage,
         page_cache::{PageCache, PageCacheKey},
@@ -196,6 +197,38 @@ impl Page {
         self.get()
             .wal_tag
             .store(pack_tag_pair(frame, e), Ordering::Release);
+    }
+
+    /// Increment the pin count by 1. A pin count >0 means the page is pinned and not eligible for eviction from the page cache.
+    pub fn pin(&self) {
+        self.get().pin_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Decrement the pin count by 1. If the count reaches 0, the page is no longer
+    /// pinned and is eligible for eviction from the page cache.
+    pub fn unpin(&self) {
+        let was_pinned = self.try_unpin();
+
+        assert!(
+            was_pinned,
+            "Attempted to unpin page {} that was not pinned",
+            self.get().id
+        );
+    }
+
+    /// Try to decrement the pin count by 1, but do nothing if it was already 0.
+    /// Returns true if the pin count was decremented.
+    pub fn try_unpin(&self) -> bool {
+        self.get()
+            .pin_count
+            .fetch_update(Ordering::Release, Ordering::SeqCst, |current| {
+                if current == 0 {
+                    None
+                } else {
+                    Some(current - 1)
+                }
+            })
+            .is_ok()
     }
 }
 
@@ -630,6 +663,21 @@ impl Pager {
             }
             Err(e) => return Err(e.into()),
         }
+        Ok(())
+    }
+
+    /// 페이지를 dirty로 설정하고 dirty_pages에 추가
+    pub fn add_dirty(&self, page: &Page) -> Result<()> {
+        assert!(
+            page.is_loaded(),
+            "page {} must be loaded in add_dirty() so its contents can be subjournaled",
+            page.get().id
+        );
+        self.subjournal_page_if_required(page)?;
+        // TODO: check duplicates?
+        let mut dirty_pages = self.dirty_pages.write();
+        dirty_pages.insert(page.get().id);
+        page.set_dirty();
         Ok(())
     }
 }

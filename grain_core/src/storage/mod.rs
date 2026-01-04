@@ -7,4 +7,5 @@ pub(crate) mod page_cache;
 pub(crate) mod pager;
 pub(super) mod slot_bitmap;
 pub(crate) mod sqlite3_ondisk;
+mod state_machines;
 pub mod wal;
